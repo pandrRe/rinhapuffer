@@ -458,10 +458,11 @@ fn build_search_queries(ds: transform_reference.Dataset, queries: *[SEARCH_QUERI
 }
 
 fn bench_cosine_topk(allocator: std.mem.Allocator) !SearchStats {
-    var bufs = try setup_reference_buffers(allocator, REFERENCE_PATH);
-    defer bufs.deinit(allocator);
-
-    const ds = try transform_reference.parse_into(bufs.mapped.bytes, bufs.features, bufs.labels);
+    // Production-shape setup: mmap the prepped artifact, no parse, no alloc.
+    // The warm pass below faults all 168 MB of feature pages in before timing.
+    var blob = try dataset_blob.load(DATASET_BIN_PATH);
+    defer blob.deinit();
+    const ds = blob.dataset;
 
     var queries: [SEARCH_QUERIES][search.N_FEATURES]f32 = undefined;
     build_search_queries(ds, &queries);
@@ -682,22 +683,29 @@ pub fn main(init: std.process.Init) !void {
     const per_call = try bench_payload_per_call(allocator, pc_slices[0..pc_n], PAYLOAD_BATCH_REPEATS);
     print_per_call_stats("payload.vectorize", per_call);
 
-    std.debug.print("\n=== cosine top-K (brute force, no index) ===\n\n", .{});
-
-    const search_stats = try bench_cosine_topk(allocator);
-    print_search_stats("search.cosine_topk", search_stats);
-
-    std.debug.print("\n=== dataset.bin mmap-only load ===\n\n", .{});
-
+    // Probe dataset.bin once — both benches below consume it. Run the
+    // dataset_blob.load bench BEFORE cosine_topk: the load path doesn't fault
+    // any feature pages (header-only access), so it measures cold-cache state,
+    // which is what the boot path will actually see in production.
     var probe3 = dataset_blob.load(DATASET_BIN_PATH) catch |err| switch (err) {
         error.FileNotFound => {
-            std.debug.print("dataset.bin bench: skipped (run `zig build prep` first)\n", .{});
+            std.debug.print(
+                "\nskipped (run `zig build prep` first): dataset.bin load + cosine top-K\n",
+                .{},
+            );
             return;
         },
         else => return err,
     };
     probe3.deinit();
 
+    std.debug.print("\n=== dataset.bin mmap-only load ===\n\n", .{});
+
     const load_stats = try bench_dataset_load();
     print_load_stats("dataset_blob.load", load_stats);
+
+    std.debug.print("\n=== cosine top-K (brute force, no index) ===\n\n", .{});
+
+    const search_stats = try bench_cosine_topk(allocator);
+    print_search_stats("search.cosine_topk", search_stats);
 }
