@@ -85,3 +85,14 @@
   - `docs: add implementation plan and log prior work`
   - `feat: cosine top-k brute-force search`
   - `chore: add test data sampling script`
+- Phase 2 — L2-normalize at parse, switch search to plain dot product
+  - 2.1: `parse_into` stashes 14 raw f32s in a stack array, accumulates `sum_sq`, divides by `1/@sqrt(sum_sq)` and writes column-major. `Dataset` drops the `norms` field; signature is back to two buffers (`features`, `labels`). `std.debug.assert(sum_sq > 0)` for the zero-norm precondition.
+  - 2.2: `cosine_topk` drops q-norm setup, the `norms[row..][0..W].*` load, the `* inv_q_vec` and the `/ r_norms` per W-row batch. Heap stores raw dot products; output indices match cosine top-K because rows are unit-norm and `|q|` is order-preserving across the scan.
+  - `naive_cosine_topk` now computes `|r|` independently in f64 — does not trust the dataset's unit-norm post-condition, so the differential test catches regressions in either parse or search.
+  - SIMD-tail test rewrote n=10 rows with strictly-decreasing unit-norm vectors so the assertion no longer relies on insertion-order tie-breaking (Phase 1 had every score = 1.0 by construction).
+  - `bench.zig` swept: `ReferenceBuffers`, `setup_reference_buffers`, `dataset_memory_bytes`, `parse_stdjson_into` all drop the norms column; the std.json baseline now also L2-normalizes per row to keep the comparison meaningful.
+  - 2.3: bench delta — `cosine_topk` per-call min **3.31 ms** (was 3.74), p50 3.43 ms (was 4.0), p95 4.05 ms (was 4.8), p99 4.67 ms (was 5.5); scan rate **905M rows/s** (was 803M) → 11–15% across the distribution. Dataset memory dropped from 174 MiB to 163 MiB (the 12 MB norms column).
+  - 37/37 tests pass.
+- Two commits landed
+  - `docs: log phase 1 work` (carry-over)
+  - `feat: l2-normalize dataset at parse, plain-dot search`
