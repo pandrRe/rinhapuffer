@@ -65,3 +65,23 @@
 - Two commits landed
   - `feat: payload vectorizer and dataset buffer api`
   - `docs: add work log`
+- Architecture session for the full app
+  - settled on raw blocking sync TCP (io_uring not worth it at 0.25 CPU; SQPOLL needs a whole core)
+  - boot path: build-time `prep` reads `references.json`, normalizes + builds index, writes `dataset.bin`; runtime `mmap`s the blob
+  - HTTP path: `GET /ready`, `POST /fraud-score` → vectorize → top-5 cosine → `score = #fraud / 5` → approved iff `score < 0.6`
+  - RAM math: 3M × 14 × f32 = 168 MB > 150 MB cap → must quantize to u16 (84 MB) at minimum
+  - index choice: ruled out HNSW (M=16 → 192 MB graph alone blows the cap); IVF wins (1024 centroids × 14 f32 ≈ 56 KB metadata, probe N=8 clusters → ~24k–48k rows scanned vs 3M)
+  - cosine vs euclidean on unit-normalized data: same top-K (euclidean² = 2 − 2·cos); cosine ~7–14% faster end-to-end (no per-row r² table = no extra 12 MB; fewer ops; 28 vs 32 B/row)
+- Wrote `docs/PLAN.md` — 9-phase roadmap, each landable as one commit
+- Phase 1 — cosine top-K brute force (no quantization, no IVF)
+  - 1.1: added `norms: []f32` to `Dataset` (caller-owned buffer like features/labels); `parse_into` now computes `sqrt(Σ f²)` per row inline (single pass, sum-of-squares accumulator); `BufferTooSmall` checks all three buffers; bench + std.json baseline updated symmetrically
+  - 1.2: new `src/search.zig` — `cosine_topk(ds, q: *const [14]f32, out: *[5]u32)`. W=8 SIMD lanes via `@Vector(8, f32)`, `inline for (0..14)` of `@mulAdd`, ascending top-5 insertion-sift heap, output reversed for descending order. Scalar tail for `n % 8 != 0`.
+  - 1.3: hand-built tiny tests — n=5 with constructed unit-norm rows of known cosines [1.0, 0.9, 0.5, 0.0, −1.0]; n=10 = W+2 to exercise both SIMD batch and scalar tail
+  - 1.4: differential test — 8 queries (4 dataset rows + 4 hand-rolled) match an O(n log n) `f64` naive sort on `example-references.json` exactly
+  - 1.5: bench on full `references.json` (3M rows): per-call min **3.74 ms**, p50 4.0 ms, p95 4.8 ms, p99 5.5 ms; ~803M rows/s scan rate (memory-bandwidth bound, as predicted)
+  - confirms a brute-force scan is ~10× too slow for sustained load at 0.25 CPU → IVF in Phase 5 will close the gap
+- `scripts/sample_test_data.py` — random-samples N entries from `rinha-de-backend-2026/test/test-data.json` with a seeded RNG, writes `resources/test-data-sample.json` preserving the input shape (delegated to a subagent)
+- Three commits landed
+  - `docs: add implementation plan and log prior work`
+  - `feat: cosine top-k brute-force search`
+  - `chore: add test data sampling script`
