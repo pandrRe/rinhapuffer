@@ -1,11 +1,16 @@
 //! Cosine top-K search over a column-major SoA `Dataset`.
 //!
+//! Input invariant: dataset rows are L2-normalized (set up by
+//! `transform_reference.parse_into`). Given that, cosine top-K reduces to
+//! plain dot-product top-K — `|q|` is the same scalar for every row, so
+//! dividing by it is order-preserving and the top-K *indices* are identical.
+//! Score values stored internally are raw dot products, not cosines.
+//!
 //! Strategy: W rows in parallel via `@Vector(W, f32)`. For each batch the inner
 //! loop is `inline for (0..N_FEATURES)` of FMAs against query lanes broadcast
-//! once into vectors. Scores are then divided by the per-lane row norms.
-//! A small ascending-sorted top-K array tracks the best matches seen so far —
-//! insertion-sift on each lane that beats the current minimum. Tail rows
-//! (`n % W != 0`) fall back to a scalar pass.
+//! once into vectors. A small ascending-sorted top-K array tracks the best
+//! matches seen so far — insertion-sift on each lane that beats the current
+//! minimum. Tail rows (`n % W != 0`) fall back to a scalar pass.
 
 const std = @import("std");
 const transform_reference = @import("transform_reference.zig");
@@ -22,8 +27,10 @@ const Vec = @Vector(W, f32);
 /// broken by lower row index winning (insertion-order — first to reach a
 /// given score keeps its slot).
 ///
-/// Requires `ds.n >= TOP_K`. Caller provides a non-zero query (`|q| > 0`);
-/// a zero query produces undefined results (every score is 0/NaN).
+/// Requires `ds.n >= TOP_K` and dataset rows L2-normalized (the post-condition
+/// of `transform_reference.parse_into`). The query `q` may have any norm; the
+/// returned indices are correct cosine top-K since `|q|` is constant across
+/// the scan and dividing by it is order-preserving.
 pub fn cosine_topk(
     ds: transform_reference.Dataset,
     q: *const [N_FEATURES]f32,
@@ -31,13 +38,8 @@ pub fn cosine_topk(
 ) void {
     std.debug.assert(ds.n >= TOP_K);
 
-    var q_sum_sq: f32 = 0;
-    inline for (0..N_FEATURES) |k| q_sum_sq += q[k] * q[k];
-    const inv_q_norm: f32 = 1.0 / @sqrt(q_sum_sq);
-
     var q_vec: [N_FEATURES]Vec = undefined;
     inline for (0..N_FEATURES) |k| q_vec[k] = @splat(q[k]);
-    const inv_q_vec: Vec = @splat(inv_q_norm);
 
     // Top-K kept ascending: top_scores[0] is the smallest of the current best.
     // Initialise with -inf so the first TOP_K rows always displace the sentinel.
@@ -46,7 +48,6 @@ pub fn cosine_topk(
 
     const n = ds.n;
     const features = ds.features;
-    const norms = ds.norms;
 
     var row: usize = 0;
     while (row + W <= n) : (row += W) {
@@ -55,11 +56,9 @@ pub fn cosine_topk(
             const r_chunk: Vec = features[k * n + row ..][0..W].*;
             dot = @mulAdd(Vec, q_vec[k], r_chunk, dot);
         }
-        const r_norms: Vec = norms[row..][0..W].*;
-        const scores: Vec = (dot * inv_q_vec) / r_norms;
 
         inline for (0..W) |lane| {
-            const s = scores[lane];
+            const s = dot[lane];
             if (s > top_scores[0]) {
                 sift_in(&top_scores, &top_rows, s, @intCast(row + lane));
             }
@@ -71,9 +70,8 @@ pub fn cosine_topk(
         inline for (0..N_FEATURES) |k| {
             dot = @mulAdd(f32, q[k], features[k * n + row], dot);
         }
-        const score = dot * inv_q_norm / norms[row];
-        if (score > top_scores[0]) {
-            sift_in(&top_scores, &top_rows, score, @intCast(row));
+        if (dot > top_scores[0]) {
+            sift_in(&top_scores, &top_rows, dot, @intCast(row));
         }
     }
 
@@ -114,21 +112,18 @@ test "cosine_topk hand-built tiny dataset" {
 
     var features: [N_FEATURES * n]f32 = @splat(0);
     var labels: [n]bool = @splat(false);
-    var norms: [n]f32 = undefined;
 
     // Place feature 0 = expected_cos[row], feature 1 = sqrt(1 - cos²).
-    // This gives unit-norm rows, so cosine = feature 0 directly.
+    // This gives unit-norm rows, so dot vs q = feature 0 directly.
     for (expected_cos, 0..) |c, row| {
         features[0 * n + row] = c;
         features[1 * n + row] = @sqrt(@max(0.0, 1.0 - c * c));
-        norms[row] = 1.0;
     }
 
     const ds: transform_reference.Dataset = .{
         .n = n,
         .features = &features,
         .labels = &labels,
-        .norms = &norms,
     };
     var q: [N_FEATURES]f32 = @splat(0);
     q[0] = 1.0;
@@ -142,24 +137,23 @@ test "cosine_topk hand-built tiny dataset" {
 
 test "cosine_topk SIMD-tail: rows just past a W boundary" {
     // n = 10 = W + 2 → exercises both the SIMD batch and the scalar tail.
+    // Construct unit-norm rows with strictly decreasing cosine vs q=[1,0,...]:
+    // feature_0 = c, feature_1 = sqrt(1 - c²) → dot(q, r) = c.
     const n: usize = 10;
     var features: [N_FEATURES * n]f32 = @splat(0);
     var labels: [n]bool = @splat(false);
-    var norms: [n]f32 = undefined;
 
-    // Row r: feature 0 = (10 - r) / 10. All other features 0. So cosine vs
-    // q=[1,0,...] equals (10-r)/10 → row 0 is best, row 9 is worst.
     for (0..n) |row| {
-        const v: f32 = @as(f32, @floatFromInt(n - row)) / 10.0;
-        features[0 * n + row] = v;
-        norms[row] = v;
+        const c: f32 = @as(f32, @floatFromInt(n - 1 - row)) /
+            @as(f32, @floatFromInt(n - 1));
+        features[0 * n + row] = c;
+        features[1 * n + row] = @sqrt(@max(0.0, 1.0 - c * c));
     }
 
     const ds: transform_reference.Dataset = .{
         .n = n,
         .features = &features,
         .labels = &labels,
-        .norms = &norms,
     };
     var q: [N_FEATURES]f32 = @splat(0);
     q[0] = 1.0;
@@ -171,6 +165,9 @@ test "cosine_topk SIMD-tail: rows just past a W boundary" {
 }
 
 /// Naive O(n log n) reference: compute every cosine, sort all, return top-K.
+/// Computes `|r|` independently in f64 — does **not** trust the dataset's
+/// unit-norm post-condition. That way this differential test catches
+/// regressions in either `parse_into`'s normalization or `cosine_topk`'s math.
 fn naive_cosine_topk(
     allocator: std.mem.Allocator,
     ds: transform_reference.Dataset,
@@ -186,10 +183,13 @@ fn naive_cosine_topk(
 
     for (0..ds.n) |row| {
         var dot: f64 = 0;
+        var r_sum_sq: f64 = 0;
         for (0..N_FEATURES) |k| {
-            dot += @as(f64, ds.features[k * ds.n + row]) * @as(f64, q[k]);
+            const v: f64 = ds.features[k * ds.n + row];
+            dot += v * @as(f64, q[k]);
+            r_sum_sq += v * v;
         }
-        const r_norm: f64 = ds.norms[row];
+        const r_norm: f64 = @sqrt(r_sum_sq);
         const s: f32 = @floatCast(dot / (q_norm * r_norm));
         scores[row] = .{ .score = s, .row = @intCast(row) };
     }
@@ -219,10 +219,8 @@ test "cosine_topk vs naive on example-references.json" {
     defer allocator.free(features);
     const labels = try allocator.alloc(bool, n);
     defer allocator.free(labels);
-    const norms = try allocator.alloc(f32, n);
-    defer allocator.free(norms);
 
-    const ds = try transform_reference.parse_into(mapped.bytes, features, labels, norms);
+    const ds = try transform_reference.parse_into(mapped.bytes, features, labels);
 
     // A handful of arbitrary queries. Use rows of the dataset itself as
     // queries (guaranteed non-zero) plus some constructed ones. With 14d

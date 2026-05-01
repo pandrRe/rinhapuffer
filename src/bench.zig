@@ -35,20 +35,17 @@ const Stats = struct {
 
 fn dataset_memory_bytes(ds: transform_reference.Dataset) usize {
     return ds.features.len * @sizeOf(f32) +
-        ds.labels.len * @sizeOf(bool) +
-        ds.norms.len * @sizeOf(f32);
+        ds.labels.len * @sizeOf(bool);
 }
 
 const ReferenceBuffers = struct {
     mapped: fast_json.Mapped,
     features: []f32,
     labels: []bool,
-    norms: []f32,
 
     fn deinit(self: *ReferenceBuffers, allocator: std.mem.Allocator) void {
         allocator.free(self.features);
         allocator.free(self.labels);
-        allocator.free(self.norms);
         self.mapped.deinit();
     }
 };
@@ -61,9 +58,7 @@ fn setup_reference_buffers(allocator: std.mem.Allocator, path: []const u8) !Refe
     errdefer allocator.free(features);
     const labels = try allocator.alloc(bool, n);
     errdefer allocator.free(labels);
-    const norms = try allocator.alloc(f32, n);
-    errdefer allocator.free(norms);
-    return .{ .mapped = mapped, .features = features, .labels = labels, .norms = norms };
+    return .{ .mapped = mapped, .features = features, .labels = labels };
 }
 
 fn ms(ns: u64) f64 {
@@ -117,7 +112,7 @@ fn bench_reference_mmap(allocator: std.mem.Allocator, runs_buf: []u64) !Stats {
     defer bufs.deinit(allocator);
 
     const t0 = now_ns();
-    const ds_cold = try transform_reference.parse_into(bufs.mapped.bytes, bufs.features, bufs.labels, bufs.norms);
+    const ds_cold = try transform_reference.parse_into(bufs.mapped.bytes, bufs.features, bufs.labels);
     const t1 = now_ns();
     const cold_ns = t1 - t0;
     const bytes_out = dataset_memory_bytes(ds_cold);
@@ -125,7 +120,7 @@ fn bench_reference_mmap(allocator: std.mem.Allocator, runs_buf: []u64) !Stats {
 
     for (runs_buf) |*t| {
         const a = now_ns();
-        _ = try transform_reference.parse_into(bufs.mapped.bytes, bufs.features, bufs.labels, bufs.norms);
+        _ = try transform_reference.parse_into(bufs.mapped.bytes, bufs.features, bufs.labels);
         const b = now_ns();
         t.* = b - a;
     }
@@ -146,7 +141,6 @@ fn parse_stdjson_into(
     contents: []const u8,
     features: []f32,
     labels: []bool,
-    norms: []f32,
 ) !transform_reference.Dataset {
     const Entry = struct {
         vector: [transform_reference.N_FEATURES]f32,
@@ -158,22 +152,22 @@ fn parse_stdjson_into(
     const n = parsed.value.len;
     if (features.len < transform_reference.N_FEATURES * n) return error.BufferTooSmall;
     if (labels.len < n) return error.BufferTooSmall;
-    if (norms.len < n) return error.BufferTooSmall;
 
     const f = features[0 .. transform_reference.N_FEATURES * n];
     const l = labels[0..n];
-    const nrm = norms[0..n];
+    // Mirror parse_into's L2-normalization so the std.json baseline produces
+    // an identical dataset shape and consumes the same memory.
     for (parsed.value, 0..) |entry, row| {
         l[row] = std.mem.eql(u8, entry.label, "fraud");
         var sum_sq: f32 = 0;
+        for (entry.vector) |v| sum_sq += v * v;
+        const inv_norm: f32 = 1.0 / @sqrt(sum_sq);
         for (entry.vector, 0..) |v, c| {
-            f[c * n + row] = v;
-            sum_sq += v * v;
+            f[c * n + row] = v * inv_norm;
         }
-        nrm[row] = @sqrt(sum_sq);
     }
 
-    return .{ .n = n, .features = f, .labels = l, .norms = nrm };
+    return .{ .n = n, .features = f, .labels = l };
 }
 
 fn bench_reference_stdjson(
@@ -184,7 +178,7 @@ fn bench_reference_stdjson(
     defer bufs.deinit(allocator);
 
     const t0 = now_ns();
-    const ds_cold = try parse_stdjson_into(allocator, bufs.mapped.bytes, bufs.features, bufs.labels, bufs.norms);
+    const ds_cold = try parse_stdjson_into(allocator, bufs.mapped.bytes, bufs.features, bufs.labels);
     const t1 = now_ns();
     const cold_ns = t1 - t0;
     const bytes_out = dataset_memory_bytes(ds_cold);
@@ -192,7 +186,7 @@ fn bench_reference_stdjson(
 
     for (runs_buf) |*t| {
         const a = now_ns();
-        _ = try parse_stdjson_into(allocator, bufs.mapped.bytes, bufs.features, bufs.labels, bufs.norms);
+        _ = try parse_stdjson_into(allocator, bufs.mapped.bytes, bufs.features, bufs.labels);
         const b = now_ns();
         t.* = b - a;
     }
@@ -464,7 +458,7 @@ fn bench_cosine_topk(allocator: std.mem.Allocator) !SearchStats {
     var bufs = try setup_reference_buffers(allocator, REFERENCE_PATH);
     defer bufs.deinit(allocator);
 
-    const ds = try transform_reference.parse_into(bufs.mapped.bytes, bufs.features, bufs.labels, bufs.norms);
+    const ds = try transform_reference.parse_into(bufs.mapped.bytes, bufs.features, bufs.labels);
 
     var queries: [SEARCH_QUERIES][search.N_FEATURES]f32 = undefined;
     build_search_queries(ds, &queries);
