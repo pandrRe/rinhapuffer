@@ -6,6 +6,7 @@ pub const fast_json = @import("fast_json.zig");
 pub const transform_reference = @import("transform_reference.zig");
 pub const payload = @import("payload.zig");
 pub const search = @import("search.zig");
+pub const dataset_blob = @import("dataset_blob.zig");
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
 ///
@@ -27,4 +28,5 @@ test {
     _ = transform_reference;
     _ = payload;
     _ = search;
+    _ = dataset_blob;
 }

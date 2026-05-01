@@ -8,9 +8,12 @@ const transform_reference = rinhapuffer.transform_reference;
 const fast_json = rinhapuffer.fast_json;
 const payload = rinhapuffer.payload;
 const search = rinhapuffer.search;
+const dataset_blob = rinhapuffer.dataset_blob;
 
 const REFERENCE_PATH = "./resources/references.json";
 const PAYLOADS_PATH = "./resources/example-payloads.json";
+const DATASET_BIN_PATH = "./resources/dataset.bin";
+const LOAD_RUNS = 50;
 const MMAP_RUNS = 5;
 const STDJSON_RUNS = 3; // std.json is slow; fewer runs to keep total wall time reasonable.
 const PAYLOAD_RUNS = 7;
@@ -547,6 +550,76 @@ fn print_search_stats(label: []const u8, s: SearchStats) void {
     );
 }
 
+// ─── dataset.bin mmap-only load ─────────────────────────────────────────────
+
+const LoadStats = struct {
+    runs: usize,
+    file_bytes: usize,
+    records: usize,
+    min_ns: f64,
+    p50_ns: f64,
+    p99_ns: f64,
+    mean_ns: f64,
+};
+
+/// Time the warm `dataset_blob.load` path: open + fstat + mmap + header
+/// validation. No body parsing, so this is essentially syscalls. Cold-state
+/// page-fault timing is not measured here — that's a Phase 7 concern.
+fn bench_dataset_load() !LoadStats {
+    var samples: [LOAD_RUNS]u64 = undefined;
+    var n_records: usize = 0;
+    var file_bytes: usize = 0;
+
+    for (&samples) |*s| {
+        const a = now_ns();
+        var blob = try dataset_blob.load(DATASET_BIN_PATH);
+        const b = now_ns();
+        s.* = b - a;
+        n_records = blob.dataset.n;
+        file_bytes = blob.mapped.bytes.len;
+        blob.deinit();
+    }
+
+    std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+
+    var sum: u128 = 0;
+    for (samples) |x| sum += x;
+    const mean = @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(samples.len));
+
+    return .{
+        .runs = samples.len,
+        .file_bytes = file_bytes,
+        .records = n_records,
+        .min_ns = @floatFromInt(samples[0]),
+        .p50_ns = @floatFromInt(percentile(&samples, 0.50)),
+        .p99_ns = @floatFromInt(percentile(&samples, 0.99)),
+        .mean_ns = mean,
+    };
+}
+
+fn print_load_stats(label: []const u8, s: LoadStats) void {
+    std.debug.print(
+        "  {s} (warm-only, {d} runs)\n" ++
+            "    file size:    {d} bytes ({d:.2} MiB)\n" ++
+            "    records:      {d}\n" ++
+            "    per-call min: {d:.1} µs\n" ++
+            "    per-call p50: {d:.1} µs\n" ++
+            "    per-call p99: {d:.1} µs\n" ++
+            "    per-call mean:{d:.1} µs\n",
+        .{
+            label,
+            s.runs,
+            s.file_bytes,
+            mib(s.file_bytes),
+            s.records,
+            s.min_ns / 1.0e3,
+            s.p50_ns / 1.0e3,
+            s.p99_ns / 1.0e3,
+            s.mean_ns / 1.0e3,
+        },
+    );
+}
+
 // ─── main ───────────────────────────────────────────────────────────────────
 
 pub fn main(init: std.process.Init) !void {
@@ -613,4 +686,18 @@ pub fn main(init: std.process.Init) !void {
 
     const search_stats = try bench_cosine_topk(allocator);
     print_search_stats("search.cosine_topk", search_stats);
+
+    std.debug.print("\n=== dataset.bin mmap-only load ===\n\n", .{});
+
+    var probe3 = dataset_blob.load(DATASET_BIN_PATH) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("dataset.bin bench: skipped (run `zig build prep` first)\n", .{});
+            return;
+        },
+        else => return err,
+    };
+    probe3.deinit();
+
+    const load_stats = try bench_dataset_load();
+    print_load_stats("dataset_blob.load", load_stats);
 }

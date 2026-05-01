@@ -159,6 +159,24 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run all benchmarks");
     bench_step.dependOn(&bench_run.step);
 
+    // `prep` step: build resources/dataset.bin from resources/references.json.
+    // ReleaseFast since it parses 284 MB of JSON.
+    const prep_mod = b.createModule(.{
+        .root_source_file = b.path("src/build_dataset.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "rinhapuffer", .module = mod },
+        },
+    });
+    const prep_exe = b.addExecutable(.{
+        .name = "prep",
+        .root_module = prep_mod,
+    });
+    const prep_run = b.addRunArtifact(prep_exe);
+    const prep_step = b.step("prep", "Build resources/dataset.bin from references.json");
+    prep_step.dependOn(&prep_run.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

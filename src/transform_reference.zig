@@ -16,10 +16,10 @@ pub const N_FEATURES: usize = 14;
 /// Buffers are caller-owned. `Dataset` only holds aliasing views.
 pub const Dataset = struct {
     n: usize,
-    features: []f32,
-    labels: []bool,
+    features: []const f32,
+    labels: []const bool,
 
-    pub fn col(self: Dataset, c: usize) []f32 {
+    pub fn col(self: Dataset, c: usize) []const f32 {
         return self.features[c * self.n .. (c + 1) * self.n];
     }
 
