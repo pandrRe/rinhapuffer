@@ -47,3 +47,21 @@
   - `take_known_merchants`, `take_merchant_id` (capture byte ranges, no outputs)
 - Added payload bench in `bench.zig` with anchor + `doNotOptimizeAway` to defeat dead-code elimination
   - 386 ns per payload, 2.59M payloads/s, 1595 MiB/s (50 payloads × 1000 reps × 7 timed runs)
+- Refactored `Dataset` to caller-owned buffers
+  - dropped `allocator` parameter and `deinit`; `Dataset` is now a plain view over `features: []f32` and `labels: []bool`
+  - `load_dataset` replaced by `parse_into(bytes, features_buf, labels_buf) Error!Dataset`
+  - exposed `count_records(bytes)` so callers can size buffers before parsing
+  - returns `error.BufferTooSmall` if either buffer is undersized
+  - bench pre-allocates buffers + mmap once and reuses across runs (matches deployment shape)
+  - `parse_into` warm min: 305 ms, 932 MiB/s, 9.84M records/s (up from 859 MiB/s when alloc was inside the timed loop)
+  - std.json baseline updated to the same buffer-reuse shape; speedup widened to 5.5×
+- Added per-call latency distribution to payload bench
+  - `bench_payload_per_call` times each full pass over the 50 payloads as one sample (~20 µs, well above macOS `clock_gettime` ~1 µs resolution); divides by `calls_per_pass` for per-call ns
+  - 1000 passes → distribution: min 380 ns, p50 380, p95 400, p99 480, max 600, mean 386 ± 19
+- Discussion of cosine kNN over the SoA dataset
+  - confirmed SoA wins by 2–3× at small feature counts because the per-row reduce in AoS dominates the critical path; crossover to AoS is ~64–128 features
+  - sketched `cosine_top5(ds, q)` with W=8 row-parallel dot products and a 5-element insertion-sift heap
+  - back-of-envelope: linear top-K over 3M rows is ~600 µs–1.2 ms per query (memory-bandwidth bound), so 1M RPS requires an ANN index (HNSW/IVF), not raw scan
+- Two commits landed
+  - `feat: payload vectorizer and dataset buffer api`
+  - `docs: add work log`
