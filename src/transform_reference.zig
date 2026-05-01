@@ -9,11 +9,14 @@ pub const N_FEATURES: usize = 14;
 /// record `r` is stored at `features[k * n + r]`, so each feature column is
 /// contiguous across all records — ideal for per-feature SIMD reductions.
 ///
+/// `norms[r] = sqrt(Σ_k features[k*n+r]²)` — precomputed for cosine search.
+///
 /// Buffers are caller-owned. `Dataset` only holds aliasing views.
 pub const Dataset = struct {
     n: usize,
     features: []f32,
     labels: []bool,
+    norms: []f32,
 
     pub fn col(self: Dataset, c: usize) []f32 {
         return self.features[c * self.n .. (c + 1) * self.n];
@@ -33,22 +36,25 @@ pub inline fn count_records(bytes: []const u8) usize {
 }
 
 /// Parse a reference-dataset JSON into caller-provided buffers. Writes
-/// `N_FEATURES * n` floats into `features_buf` (column-major) and `n`
-/// bools into `labels_buf`. Returns a `Dataset` whose slices alias the
-/// used prefixes of those buffers.
+/// `N_FEATURES * n` floats into `features_buf` (column-major), `n` bools
+/// into `labels_buf`, and `n` row L2-norms into `norms_buf`. Returns a
+/// `Dataset` whose slices alias the used prefixes of those buffers.
 pub fn parse_into(
     bytes: []const u8,
     features_buf: []f32,
     labels_buf: []bool,
+    norms_buf: []f32,
 ) Error!Dataset {
     const n = count_records(bytes);
     if (features_buf.len < N_FEATURES * n) return error.BufferTooSmall;
     if (labels_buf.len < n) return error.BufferTooSmall;
+    if (norms_buf.len < n) return error.BufferTooSmall;
 
     const features = features_buf[0 .. N_FEATURES * n];
     const labels = labels_buf[0..n];
+    const norms = norms_buf[0..n];
 
-    if (n == 0) return .{ .n = 0, .features = features, .labels = labels };
+    if (n == 0) return .{ .n = 0, .features = features, .labels = labels, .norms = norms };
 
     var p = fast_json.skip_ws(bytes, 0);
     p = try fast_json.expect_byte(bytes, p, '[');
@@ -65,16 +71,19 @@ pub fn parse_into(
         p = fast_json.skip_ws(bytes, p);
         p = try fast_json.expect_byte(bytes, p, '[');
 
+        var sum_sq: f32 = 0;
         inline for (0..N_FEATURES) |k| {
             p = fast_json.skip_ws(bytes, p);
             const r = try fast_json.parse_f32_simple(bytes, p);
             features[k * n + row] = r.value;
+            sum_sq += r.value * r.value;
             p = r.next;
             if (k < N_FEATURES - 1) {
                 p = fast_json.skip_ws(bytes, p);
                 p = try fast_json.expect_byte(bytes, p, ',');
             }
         }
+        norms[row] = @sqrt(sum_sq);
 
         p = fast_json.skip_ws(bytes, p);
         p = try fast_json.expect_byte(bytes, p, ']');
@@ -102,7 +111,7 @@ pub fn parse_into(
     p = fast_json.skip_ws(bytes, p);
     p = try fast_json.expect_byte(bytes, p, ']');
 
-    return .{ .n = n, .features = features, .labels = labels };
+    return .{ .n = n, .features = features, .labels = labels, .norms = norms };
 }
 
 test "parse_into example references" {
@@ -116,12 +125,25 @@ test "parse_into example references" {
     defer allocator.free(features);
     const labels = try allocator.alloc(bool, n);
     defer allocator.free(labels);
+    const norms = try allocator.alloc(f32, n);
+    defer allocator.free(norms);
 
-    const dataset = try parse_into(mapped.bytes, features, labels);
+    const dataset = try parse_into(mapped.bytes, features, labels, norms);
 
     try std.testing.expectEqual(@as(usize, 100), dataset.n);
     try std.testing.expectEqual(N_FEATURES * dataset.n, dataset.features.len);
     try std.testing.expectEqual(dataset.n, dataset.labels.len);
+    try std.testing.expectEqual(dataset.n, dataset.norms.len);
+
+    for (0..dataset.n) |row| {
+        var sum_sq: f64 = 0;
+        for (0..N_FEATURES) |c| {
+            const v: f64 = dataset.features[c * dataset.n + row];
+            sum_sq += v * v;
+        }
+        const expected: f32 = @floatCast(@sqrt(sum_sq));
+        try std.testing.expect(@abs(dataset.norms[row] - expected) <= 1.0e-4);
+    }
 }
 
 test "parse_into matches std.json on example-references.json" {
@@ -146,8 +168,10 @@ test "parse_into matches std.json on example-references.json" {
     defer allocator.free(features);
     const labels = try allocator.alloc(bool, n);
     defer allocator.free(labels);
+    const norms = try allocator.alloc(f32, n);
+    defer allocator.free(norms);
 
-    const dataset = try parse_into(contents, features, labels);
+    const dataset = try parse_into(contents, features, labels, norms);
 
     try std.testing.expectEqual(parsed.value.len, dataset.n);
     for (parsed.value, 0..) |entry, row| {
@@ -161,13 +185,47 @@ test "parse_into matches std.json on example-references.json" {
 }
 
 test "parse_into BufferTooSmall" {
+    const allocator = std.testing.allocator;
+
     var mapped = try fast_json.mmap_file("./resources/example-references.json");
     defer mapped.deinit();
 
-    var tiny_features: [10]f32 = undefined;
-    var tiny_labels: [10]bool = undefined;
-    try std.testing.expectError(
-        error.BufferTooSmall,
-        parse_into(mapped.bytes, &tiny_features, &tiny_labels),
-    );
+    const n = count_records(mapped.bytes);
+
+    // features too small
+    {
+        var tiny_features: [10]f32 = undefined;
+        const labels = try allocator.alloc(bool, n);
+        defer allocator.free(labels);
+        const norms = try allocator.alloc(f32, n);
+        defer allocator.free(norms);
+        try std.testing.expectError(
+            error.BufferTooSmall,
+            parse_into(mapped.bytes, &tiny_features, labels, norms),
+        );
+    }
+    // labels too small
+    {
+        const features = try allocator.alloc(f32, N_FEATURES * n);
+        defer allocator.free(features);
+        var tiny_labels: [10]bool = undefined;
+        const norms = try allocator.alloc(f32, n);
+        defer allocator.free(norms);
+        try std.testing.expectError(
+            error.BufferTooSmall,
+            parse_into(mapped.bytes, features, &tiny_labels, norms),
+        );
+    }
+    // norms too small
+    {
+        const features = try allocator.alloc(f32, N_FEATURES * n);
+        defer allocator.free(features);
+        const labels = try allocator.alloc(bool, n);
+        defer allocator.free(labels);
+        var tiny_norms: [10]f32 = undefined;
+        try std.testing.expectError(
+            error.BufferTooSmall,
+            parse_into(mapped.bytes, features, labels, &tiny_norms),
+        );
+    }
 }

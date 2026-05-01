@@ -7,6 +7,7 @@ const rinhapuffer = @import("rinhapuffer");
 const transform_reference = rinhapuffer.transform_reference;
 const fast_json = rinhapuffer.fast_json;
 const payload = rinhapuffer.payload;
+const search = rinhapuffer.search;
 
 const REFERENCE_PATH = "./resources/references.json";
 const PAYLOADS_PATH = "./resources/example-payloads.json";
@@ -15,6 +16,8 @@ const STDJSON_RUNS = 3; // std.json is slow; fewer runs to keep total wall time 
 const PAYLOAD_RUNS = 7;
 const PAYLOAD_BATCH_REPEATS = 1000; // amortise per-payload measurement: vectorize the whole batch this many times per timed run.
 const MAX_PAYLOADS = 128;
+const SEARCH_QUERIES = 32; // distinct queries used in cosine_topk distribution.
+const SEARCH_PASSES = 200; // each pass scans the full dataset once per query.
 
 fn now_ns() u64 {
     var ts: std.c.timespec = undefined;
@@ -31,17 +34,21 @@ const Stats = struct {
 };
 
 fn dataset_memory_bytes(ds: transform_reference.Dataset) usize {
-    return ds.features.len * @sizeOf(f32) + ds.labels.len * @sizeOf(bool);
+    return ds.features.len * @sizeOf(f32) +
+        ds.labels.len * @sizeOf(bool) +
+        ds.norms.len * @sizeOf(f32);
 }
 
 const ReferenceBuffers = struct {
     mapped: fast_json.Mapped,
     features: []f32,
     labels: []bool,
+    norms: []f32,
 
     fn deinit(self: *ReferenceBuffers, allocator: std.mem.Allocator) void {
         allocator.free(self.features);
         allocator.free(self.labels);
+        allocator.free(self.norms);
         self.mapped.deinit();
     }
 };
@@ -54,7 +61,9 @@ fn setup_reference_buffers(allocator: std.mem.Allocator, path: []const u8) !Refe
     errdefer allocator.free(features);
     const labels = try allocator.alloc(bool, n);
     errdefer allocator.free(labels);
-    return .{ .mapped = mapped, .features = features, .labels = labels };
+    const norms = try allocator.alloc(f32, n);
+    errdefer allocator.free(norms);
+    return .{ .mapped = mapped, .features = features, .labels = labels, .norms = norms };
 }
 
 fn ms(ns: u64) f64 {
@@ -108,7 +117,7 @@ fn bench_reference_mmap(allocator: std.mem.Allocator, runs_buf: []u64) !Stats {
     defer bufs.deinit(allocator);
 
     const t0 = now_ns();
-    const ds_cold = try transform_reference.parse_into(bufs.mapped.bytes, bufs.features, bufs.labels);
+    const ds_cold = try transform_reference.parse_into(bufs.mapped.bytes, bufs.features, bufs.labels, bufs.norms);
     const t1 = now_ns();
     const cold_ns = t1 - t0;
     const bytes_out = dataset_memory_bytes(ds_cold);
@@ -116,7 +125,7 @@ fn bench_reference_mmap(allocator: std.mem.Allocator, runs_buf: []u64) !Stats {
 
     for (runs_buf) |*t| {
         const a = now_ns();
-        _ = try transform_reference.parse_into(bufs.mapped.bytes, bufs.features, bufs.labels);
+        _ = try transform_reference.parse_into(bufs.mapped.bytes, bufs.features, bufs.labels, bufs.norms);
         const b = now_ns();
         t.* = b - a;
     }
@@ -137,6 +146,7 @@ fn parse_stdjson_into(
     contents: []const u8,
     features: []f32,
     labels: []bool,
+    norms: []f32,
 ) !transform_reference.Dataset {
     const Entry = struct {
         vector: [transform_reference.N_FEATURES]f32,
@@ -148,17 +158,22 @@ fn parse_stdjson_into(
     const n = parsed.value.len;
     if (features.len < transform_reference.N_FEATURES * n) return error.BufferTooSmall;
     if (labels.len < n) return error.BufferTooSmall;
+    if (norms.len < n) return error.BufferTooSmall;
 
     const f = features[0 .. transform_reference.N_FEATURES * n];
     const l = labels[0..n];
+    const nrm = norms[0..n];
     for (parsed.value, 0..) |entry, row| {
         l[row] = std.mem.eql(u8, entry.label, "fraud");
+        var sum_sq: f32 = 0;
         for (entry.vector, 0..) |v, c| {
             f[c * n + row] = v;
+            sum_sq += v * v;
         }
+        nrm[row] = @sqrt(sum_sq);
     }
 
-    return .{ .n = n, .features = f, .labels = l };
+    return .{ .n = n, .features = f, .labels = l, .norms = nrm };
 }
 
 fn bench_reference_stdjson(
@@ -169,7 +184,7 @@ fn bench_reference_stdjson(
     defer bufs.deinit(allocator);
 
     const t0 = now_ns();
-    const ds_cold = try parse_stdjson_into(allocator, bufs.mapped.bytes, bufs.features, bufs.labels);
+    const ds_cold = try parse_stdjson_into(allocator, bufs.mapped.bytes, bufs.features, bufs.labels, bufs.norms);
     const t1 = now_ns();
     const cold_ns = t1 - t0;
     const bytes_out = dataset_memory_bytes(ds_cold);
@@ -177,7 +192,7 @@ fn bench_reference_stdjson(
 
     for (runs_buf) |*t| {
         const a = now_ns();
-        _ = try parse_stdjson_into(allocator, bufs.mapped.bytes, bufs.features, bufs.labels);
+        _ = try parse_stdjson_into(allocator, bufs.mapped.bytes, bufs.features, bufs.labels, bufs.norms);
         const b = now_ns();
         t.* = b - a;
     }
@@ -414,6 +429,130 @@ fn bench_payload_vectorize(runs_buf: []u64) !Stats {
     };
 }
 
+// ─── cosine top-K over the full reference dataset ──────────────────────────
+
+const SearchStats = struct {
+    n_rows: usize,
+    queries: usize,
+    passes: usize,
+    // ns per cosine_topk call.
+    min_ns: f64,
+    p50_ns: f64,
+    p95_ns: f64,
+    p99_ns: f64,
+    max_ns: f64,
+    mean_ns: f64,
+    stddev_ns: f64,
+};
+
+/// Build `SEARCH_QUERIES` queries by sampling rows from the dataset itself
+/// and perturbing them slightly so cosine_topk can't shortcut to score=1.
+fn build_search_queries(ds: transform_reference.Dataset, queries: *[SEARCH_QUERIES][search.N_FEATURES]f32) void {
+    const stride = if (ds.n > SEARCH_QUERIES) ds.n / SEARCH_QUERIES else 1;
+    for (0..SEARCH_QUERIES) |i| {
+        const row = (i * stride) % ds.n;
+        for (0..search.N_FEATURES) |c| {
+            const v = ds.features[c * ds.n + row];
+            // Tiny per-feature perturbation to defeat any "exact match" fast path.
+            const jitter: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(c)) - 7)) * 0.001;
+            queries[i][c] = v + jitter;
+        }
+    }
+}
+
+fn bench_cosine_topk(allocator: std.mem.Allocator) !SearchStats {
+    var bufs = try setup_reference_buffers(allocator, REFERENCE_PATH);
+    defer bufs.deinit(allocator);
+
+    const ds = try transform_reference.parse_into(bufs.mapped.bytes, bufs.features, bufs.labels, bufs.norms);
+
+    var queries: [SEARCH_QUERIES][search.N_FEATURES]f32 = undefined;
+    build_search_queries(ds, &queries);
+
+    // Side-effect anchor so the optimiser keeps the call.
+    var anchor: u32 = 0;
+    var out: [search.TOP_K]u32 = undefined;
+
+    // Warm: one full pass.
+    for (&queries) |*q| {
+        search.cosine_topk(ds, q, &out);
+        anchor +%= out[0];
+    }
+
+    const total_calls = SEARCH_PASSES * SEARCH_QUERIES;
+    const samples = try allocator.alloc(u64, total_calls);
+    defer allocator.free(samples);
+
+    var idx: usize = 0;
+    for (0..SEARCH_PASSES) |_| {
+        for (&queries) |*q| {
+            const a = now_ns();
+            search.cosine_topk(ds, q, &out);
+            const b = now_ns();
+            samples[idx] = b - a;
+            idx += 1;
+            anchor +%= out[0];
+        }
+    }
+    std.mem.doNotOptimizeAway(anchor);
+
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+
+    var sum: u128 = 0;
+    var sum_sq: u128 = 0;
+    for (samples) |x| {
+        sum += x;
+        sum_sq += @as(u128, x) * @as(u128, x);
+    }
+    const n_f = @as(f64, @floatFromInt(samples.len));
+    const mean = @as(f64, @floatFromInt(sum)) / n_f;
+    const variance = @as(f64, @floatFromInt(sum_sq)) / n_f - mean * mean;
+    const stddev = @sqrt(@max(variance, 0));
+
+    return .{
+        .n_rows = ds.n,
+        .queries = SEARCH_QUERIES,
+        .passes = SEARCH_PASSES,
+        .min_ns = @floatFromInt(samples[0]),
+        .p50_ns = @floatFromInt(percentile(samples, 0.50)),
+        .p95_ns = @floatFromInt(percentile(samples, 0.95)),
+        .p99_ns = @floatFromInt(percentile(samples, 0.99)),
+        .max_ns = @floatFromInt(samples[samples.len - 1]),
+        .mean_ns = mean,
+        .stddev_ns = stddev,
+    };
+}
+
+fn print_search_stats(label: []const u8, s: SearchStats) void {
+    const total = s.passes * s.queries;
+    const rows_f = @as(f64, @floatFromInt(s.n_rows));
+    const rows_per_us_min = rows_f / (s.min_ns / 1.0e3);
+    std.debug.print(
+        "  {s} (per-call latency from {d} samples = {d} passes × {d} queries; n_rows = {d})\n" ++
+            "    per-call min:    {d:.1} µs  ({d:.1}M rows/s scan rate)\n" ++
+            "    per-call p50:    {d:.1} µs\n" ++
+            "    per-call p95:    {d:.1} µs\n" ++
+            "    per-call p99:    {d:.1} µs\n" ++
+            "    per-call max:    {d:.1} µs\n" ++
+            "    per-call mean:   {d:.1} µs ± {d:.1} (stddev)\n",
+        .{
+            label,
+            total,
+            s.passes,
+            s.queries,
+            s.n_rows,
+            s.min_ns / 1.0e3,
+            rows_per_us_min,
+            s.p50_ns / 1.0e3,
+            s.p95_ns / 1.0e3,
+            s.p99_ns / 1.0e3,
+            s.max_ns / 1.0e3,
+            s.mean_ns / 1.0e3,
+            s.stddev_ns / 1.0e3,
+        },
+    );
+}
+
 // ─── main ───────────────────────────────────────────────────────────────────
 
 pub fn main(init: std.process.Init) !void {
@@ -475,4 +614,9 @@ pub fn main(init: std.process.Init) !void {
     const pc_n = try slice_payloads(pc_mapped.bytes, &pc_slices);
     const per_call = try bench_payload_per_call(allocator, pc_slices[0..pc_n], PAYLOAD_BATCH_REPEATS);
     print_per_call_stats("payload.vectorize", per_call);
+
+    std.debug.print("\n=== cosine top-K (brute force, no index) ===\n\n", .{});
+
+    const search_stats = try bench_cosine_topk(allocator);
+    print_search_stats("search.cosine_topk", search_stats);
 }

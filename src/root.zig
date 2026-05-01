@@ -5,6 +5,7 @@ const Io = std.Io;
 pub const fast_json = @import("fast_json.zig");
 pub const transform_reference = @import("transform_reference.zig");
 pub const payload = @import("payload.zig");
+pub const search = @import("search.zig");
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
 ///
@@ -25,4 +26,5 @@ test {
     _ = fast_json;
     _ = transform_reference;
     _ = payload;
+    _ = search;
 }
