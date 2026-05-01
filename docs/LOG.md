@@ -1,0 +1,49 @@
+# Work log
+
+- Bootstrap project
+  - `git init`, added `rinha-de-backend-2026` as submodule
+  - `.gitignore` (zig caches, `resources/`, `.DS_Store`)
+  - VS Code workspace settings (4-space indent, inlay hints off)
+- Python script `scripts/copy_resources.py` to mirror submodule resources and gunzip `references.json.gz`
+- First pass at `src/transform_reference.zig` — libc-based `read_file` and a `Dataset { features: [][14]f32, labels: []bool }` loaded via `std.json`
+- Plan: fast mmap-based JSON loader for the reference dataset (3M records / 284 MiB)
+- Built `src/fast_json.zig` parser primitives
+  - `count_closing_braces` — NEON via `@Vector(16, u8)`
+  - `parse_f32_simple` — u32 accumulators, ≤ 4-digit fractions
+  - `parse_f64_simple` — u64 accumulators, ≤ 18-digit fractions (used by payloads)
+  - `parse_u32_simple` — non-negative integer parse
+  - `skip_ws`, `expect_byte`
+  - `mmap_file` (PROT.READ + MAP.PRIVATE + `madvise(SEQUENTIAL)`)
+- Replaced `load_dataset` with hand-rolled mmap parser and switched `Dataset` to true SoA flat column-major (`features: []f32` of length `14 * n`, indexed `features[col*n + row]`)
+- Differential test: parses `example-references.json` with `std.Io.Dir.cwd().openFile + std.json` and asserts element-wise match within 1e-6
+- Built `src/bench.zig` harness with reference dataset benchmarks
+  - mmap fast loader: warm 331 ms, 9.07M records/s, 859 MiB/s
+  - std.json baseline: warm 1.71 s, 1.77M records/s
+  - 5.2× speedup warm-min vs warm-min
+- Cleaned unused code: removed `LabelledVector`, libc-based `read_file`, `posix`/`libc` imports
+- Initial git commit (single root commit, 12 files, 1003 insertions)
+- Memory-footprint analysis for u16 quantization (171 MB → 87 MB; ~2× lanes per NEON load)
+- Plan: schema-rigid payload vectorizer (zero heap, zero syscalls, write into caller `*[14]f32`)
+- First pass at `src/payload.zig`
+  - `NormConstants` and `MccRiskTable` with runtime JSON loaders
+  - `Vectorizer` struct + `vectorize` method
+  - All 14 features mapped per the spec; Sakamoto for day-of-week; `days_from_civil` for minutes-between
+  - Tests against the spec golden vector and all 50 example payloads
+- Refactored to comptime lookup tables and a free function
+  - `norm` is a comptime namespace of `f32` constants
+  - `mcc_risk: [10000]f32` baked at comptime in a `blk:` block
+  - `vectorize(bytes, *[14]f32)` is a stateless free function
+- Hoisted reusable JSON helpers from `payload.zig` into `fast_json.zig`
+  - Structural: `open_obj`, `close_obj`, `comma`
+  - Keys: `expect_key`, `enter_key`
+  - Values: `skip_string`, `take_string`, `parse_bool`, `take_null`, `skip_to_matching_close`, `contains_string`
+  - Combinators: `read_f64`, `read_u32`, `read_string`, `read_bool`, `read_iso_date`
+  - Extended `ParseError` with `UnexpectedKey`, `InvalidBoolean`, `InvalidDate`
+- Renamed `payload.zig`'s `fast_json` import to `fj`
+- Split each field section in `vectorize` into per-field inline helpers with explicit `out_*: *f32` pointers
+  - `fill_amount`, `fill_installments`, `fill_requested_at`, `fill_amount_vs_avg`, `fill_tx_count_24h`
+  - `fill_mcc_risk`, `fill_merchant_avg_amount`, `fill_unknown_merchant`
+  - `fill_is_online`, `fill_card_present`, `fill_km_from_home`, `fill_last_transaction`
+  - `take_known_merchants`, `take_merchant_id` (capture byte ranges, no outputs)
+- Added payload bench in `bench.zig` with anchor + `doNotOptimizeAway` to defeat dead-code elimination
+  - 386 ns per payload, 2.59M payloads/s, 1595 MiB/s (50 payloads × 1000 reps × 7 timed runs)
