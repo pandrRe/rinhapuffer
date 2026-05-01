@@ -5,7 +5,10 @@ const libc = std.c;
 pub const ParseError = error{
     UnexpectedByte,
     UnexpectedEof,
+    UnexpectedKey,
     InvalidFloat,
+    InvalidBoolean,
+    InvalidDate,
 };
 
 /// Count occurrences of '}' in `bytes`.
@@ -73,8 +76,63 @@ pub fn parse_f32_simple(bytes: []const u8, start: usize) ParseError!ParsedF32 {
     return .{ .value = if (neg) -v else v, .next = p };
 }
 
-inline fn is_digit(b: u8) bool {
+pub inline fn is_digit(b: u8) bool {
     return b >= '0' and b <= '9';
+}
+
+pub const ParsedF64 = struct { value: f64, next: usize };
+
+/// Parse a single f64 in the format `-?\d+(\.\d+)?` (no exponent).
+///
+/// u64 accumulators handle up to ~18 digits each side without overflow — enough
+/// for any realistic JSON-emitted decimal, including the 10-digit fractions in
+/// the payload examples.
+pub fn parse_f64_simple(bytes: []const u8, start: usize) ParseError!ParsedF64 {
+    var p = start;
+    if (p >= bytes.len) return error.UnexpectedEof;
+
+    const neg = bytes[p] == '-';
+    p += @intFromBool(neg);
+
+    if (p >= bytes.len or !is_digit(bytes[p])) return error.InvalidFloat;
+
+    var int_part: u64 = 0;
+    while (p < bytes.len and is_digit(bytes[p])) : (p += 1) {
+        int_part = int_part * 10 + (bytes[p] - '0');
+    }
+
+    if (p >= bytes.len or bytes[p] != '.') {
+        const v: f64 = @floatFromInt(int_part);
+        return .{ .value = if (neg) -v else v, .next = p };
+    }
+
+    p += 1;
+    var frac: u64 = 0;
+    var scale: u64 = 1;
+    while (p < bytes.len and is_digit(bytes[p])) : (p += 1) {
+        frac = frac * 10 + (bytes[p] - '0');
+        scale *= 10;
+    }
+
+    const int_f: f64 = @floatFromInt(int_part);
+    const frac_f: f64 = @floatFromInt(frac);
+    const scale_f: f64 = @floatFromInt(scale);
+    const v = int_f + frac_f / scale_f;
+    return .{ .value = if (neg) -v else v, .next = p };
+}
+
+pub const ParsedU32 = struct { value: u32, next: usize };
+
+/// Parse a non-negative integer; up to 10 digits (u32 range).
+pub fn parse_u32_simple(bytes: []const u8, start: usize) ParseError!ParsedU32 {
+    var p = start;
+    if (p >= bytes.len or !is_digit(bytes[p])) return error.InvalidFloat;
+    var v: u64 = 0;
+    while (p < bytes.len and is_digit(bytes[p])) : (p += 1) {
+        v = v * 10 + (bytes[p] - '0');
+    }
+    if (v > std.math.maxInt(u32)) return error.InvalidFloat;
+    return .{ .value = @intCast(v), .next = p };
 }
 
 /// Skip ASCII whitespace (' ', '\t', '\n', '\r').
@@ -93,6 +151,158 @@ pub fn expect_byte(bytes: []const u8, p: usize, b: u8) ParseError!usize {
     if (p >= bytes.len) return error.UnexpectedEof;
     if (bytes[p] != b) return error.UnexpectedByte;
     return p + 1;
+}
+
+// ─── compound helpers — `skip_ws + structural byte` ────────────────────────
+
+pub inline fn open_obj(bytes: []const u8, p: usize) ParseError!usize {
+    return expect_byte(bytes, skip_ws(bytes, p), '{');
+}
+
+pub inline fn close_obj(bytes: []const u8, p: usize) ParseError!usize {
+    return expect_byte(bytes, skip_ws(bytes, p), '}');
+}
+
+pub inline fn comma(bytes: []const u8, p: usize) ParseError!usize {
+    return expect_byte(bytes, skip_ws(bytes, p), ',');
+}
+
+// ─── string + key helpers ──────────────────────────────────────────────────
+
+pub fn skip_string(bytes: []const u8, start: usize) ParseError!usize {
+    var p = try expect_byte(bytes, start, '"');
+    while (p < bytes.len) : (p += 1) {
+        if (bytes[p] == '"') return p + 1;
+    }
+    return error.UnexpectedEof;
+}
+
+pub const TakenString = struct { value: []const u8, next: usize };
+
+pub fn take_string(bytes: []const u8, start: usize) ParseError!TakenString {
+    var p = try expect_byte(bytes, start, '"');
+    const begin = p;
+    while (p < bytes.len) : (p += 1) {
+        if (bytes[p] == '"') return .{ .value = bytes[begin..p], .next = p + 1 };
+    }
+    return error.UnexpectedEof;
+}
+
+/// Match `"key"` literal, return position past closing quote.
+pub fn expect_key(bytes: []const u8, start: usize, key: []const u8) ParseError!usize {
+    var p = try expect_byte(bytes, start, '"');
+    if (p + key.len > bytes.len) return error.UnexpectedEof;
+    if (!std.mem.eql(u8, bytes[p..][0..key.len], key)) return error.UnexpectedKey;
+    p += key.len;
+    return try expect_byte(bytes, p, '"');
+}
+
+/// Match `"key" :` (with surrounding ws) and return the position of the value.
+pub inline fn enter_key(bytes: []const u8, p: usize, key: []const u8) ParseError!usize {
+    var q = try expect_key(bytes, skip_ws(bytes, p), key);
+    q = try expect_byte(bytes, skip_ws(bytes, q), ':');
+    return skip_ws(bytes, q);
+}
+
+// ─── value parsers ─────────────────────────────────────────────────────────
+
+pub const ParsedBool = struct { value: bool, next: usize };
+
+pub fn parse_bool(bytes: []const u8, start: usize) ParseError!ParsedBool {
+    if (start + 4 > bytes.len) return error.InvalidBoolean;
+    if (bytes[start] == 't') {
+        if (!std.mem.eql(u8, bytes[start..][0..4], "true")) return error.InvalidBoolean;
+        return .{ .value = true, .next = start + 4 };
+    }
+    if (bytes[start] == 'f') {
+        if (start + 5 > bytes.len) return error.InvalidBoolean;
+        if (!std.mem.eql(u8, bytes[start..][0..5], "false")) return error.InvalidBoolean;
+        return .{ .value = false, .next = start + 5 };
+    }
+    return error.InvalidBoolean;
+}
+
+/// If `bytes[p..]` starts with `null`, return position past it; else null.
+pub inline fn take_null(bytes: []const u8, p: usize) ParseError!?usize {
+    if (p < bytes.len and bytes[p] == 'n') {
+        if (p + 4 > bytes.len or !std.mem.eql(u8, bytes[p..][0..4], "null")) return error.UnexpectedByte;
+        return p + 4;
+    }
+    return null;
+}
+
+/// Skip a JSON value enclosed by `open` / `close`, accounting for nested pairs
+/// and quoted strings (no escape handling).
+pub fn skip_to_matching_close(bytes: []const u8, start: usize, open: u8, close: u8) ParseError!usize {
+    var depth: usize = 1;
+    var p = start;
+    var in_string = false;
+    while (p < bytes.len) : (p += 1) {
+        const c = bytes[p];
+        if (in_string) {
+            if (c == '"') in_string = false;
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+            continue;
+        }
+        if (c == open) depth += 1;
+        if (c == close) {
+            depth -= 1;
+            if (depth == 0) return p + 1;
+        }
+    }
+    return error.UnexpectedEof;
+}
+
+/// Linear scan over `arr_bytes` (the contents between `[` and `]` of a JSON
+/// string array) testing membership of `needle` against each `"..."` element.
+pub fn contains_string(arr_bytes: []const u8, needle: []const u8) bool {
+    var p: usize = 0;
+    while (p < arr_bytes.len) {
+        while (p < arr_bytes.len and arr_bytes[p] != '"') : (p += 1) {}
+        if (p >= arr_bytes.len) return false;
+        p += 1;
+        const begin = p;
+        while (p < arr_bytes.len and arr_bytes[p] != '"') : (p += 1) {}
+        if (p > arr_bytes.len) return false;
+        const elem = arr_bytes[begin..p];
+        if (std.mem.eql(u8, elem, needle)) return true;
+        p += 1;
+    }
+    return false;
+}
+
+// ─── "enter key + parse value" combinators ─────────────────────────────────
+
+pub inline fn read_f64(bytes: []const u8, p: usize, key: []const u8) ParseError!ParsedF64 {
+    return parse_f64_simple(bytes, try enter_key(bytes, p, key));
+}
+
+pub inline fn read_u32(bytes: []const u8, p: usize, key: []const u8) ParseError!ParsedU32 {
+    return parse_u32_simple(bytes, try enter_key(bytes, p, key));
+}
+
+pub inline fn read_string(bytes: []const u8, p: usize, key: []const u8) ParseError!TakenString {
+    return take_string(bytes, try enter_key(bytes, p, key));
+}
+
+pub inline fn read_bool(bytes: []const u8, p: usize, key: []const u8) ParseError!ParsedBool {
+    return parse_bool(bytes, try enter_key(bytes, p, key));
+}
+
+pub const ReadIsoDate = struct { value: []const u8, next: usize };
+
+/// Read a 20-byte ISO-8601 timestamp `"YYYY-MM-DDTHH:MM:SSZ"`.
+/// Returns the 20 content bytes (no quotes) and the position past the closing quote.
+pub inline fn read_iso_date(bytes: []const u8, p: usize, key: []const u8) ParseError!ReadIsoDate {
+    var q = try enter_key(bytes, p, key);
+    q = try expect_byte(bytes, q, '"');
+    if (q + 20 > bytes.len) return error.InvalidDate;
+    const value = bytes[q .. q + 20];
+    const next = try expect_byte(bytes, q + 20, '"');
+    return .{ .value = value, .next = next };
 }
 
 /// A read-only mmap of a file. Caller must call `deinit` to release.
@@ -204,6 +414,42 @@ test "parse_f32_simple errors on no digits" {
     try std.testing.expectError(error.InvalidFloat, parse_f32_simple("-x", 0));
 }
 
+test "parse_f64_simple long fraction" {
+    // Payload examples carry up to 10 fractional digits — must parse without overflow.
+    const cases = [_]struct { s: []const u8, v: f64 }{
+        .{ .s = "881.6139684714", .v = 881.6139684714 },
+        .{ .s = "29.2331036248", .v = 29.2331036248 },
+        .{ .s = "13.7090520965", .v = 13.7090520965 },
+        .{ .s = "0", .v = 0.0 },
+        .{ .s = "-1", .v = -1.0 },
+        .{ .s = "12345.678901234", .v = 12345.678901234 },
+    };
+    for (cases) |c| {
+        const got = try parse_f64_simple(c.s, 0);
+        try std.testing.expectEqual(c.s.len, got.next);
+        try std.testing.expect(@abs(got.value - c.v) <= 1.0e-12);
+    }
+}
+
+test "parse_u32_simple" {
+    {
+        const r = try parse_u32_simple("0", 0);
+        try std.testing.expectEqual(@as(u32, 0), r.value);
+        try std.testing.expectEqual(@as(usize, 1), r.next);
+    }
+    {
+        const r = try parse_u32_simple("12,foo", 0);
+        try std.testing.expectEqual(@as(u32, 12), r.value);
+        try std.testing.expectEqual(@as(usize, 2), r.next);
+    }
+    {
+        const r = try parse_u32_simple("4294967295", 0);
+        try std.testing.expectEqual(@as(u32, 4294967295), r.value);
+    }
+    try std.testing.expectError(error.InvalidFloat, parse_u32_simple("abc", 0));
+    try std.testing.expectError(error.InvalidFloat, parse_u32_simple("4294967296", 0));
+}
+
 test "skip_ws" {
     try std.testing.expectEqual(@as(usize, 0), skip_ws("abc", 0));
     try std.testing.expectEqual(@as(usize, 4), skip_ws("    abc", 0));
@@ -216,6 +462,49 @@ test "expect_byte" {
     try std.testing.expectEqual(@as(usize, 1), try expect_byte("[abc", 0, '['));
     try std.testing.expectError(error.UnexpectedByte, expect_byte("abc", 0, '['));
     try std.testing.expectError(error.UnexpectedEof, expect_byte("", 0, '['));
+}
+
+test "parse_bool" {
+    {
+        const r = try parse_bool("true,", 0);
+        try std.testing.expect(r.value);
+        try std.testing.expectEqual(@as(usize, 4), r.next);
+    }
+    {
+        const r = try parse_bool("false,", 0);
+        try std.testing.expect(!r.value);
+        try std.testing.expectEqual(@as(usize, 5), r.next);
+    }
+    try std.testing.expectError(error.InvalidBoolean, parse_bool("xyz", 0));
+}
+
+test "contains_string" {
+    const arr = "\"MERC-003\", \"MERC-016\"";
+    try std.testing.expect(contains_string(arr, "MERC-016"));
+    try std.testing.expect(contains_string(arr, "MERC-003"));
+    try std.testing.expect(!contains_string(arr, "MERC-001"));
+    try std.testing.expect(!contains_string("", "MERC-001"));
+}
+
+test "expect_key + enter_key" {
+    const s = "\"foo\" : 42,";
+    try std.testing.expectEqual(@as(usize, 5), try expect_key(s, 0, "foo"));
+    try std.testing.expectError(error.UnexpectedKey, expect_key(s, 0, "bar"));
+    const after = try enter_key(s, 0, "foo");
+    try std.testing.expectEqual(@as(usize, 8), after);
+}
+
+test "take_null" {
+    try std.testing.expectEqual(@as(?usize, 4), try take_null("null,", 0));
+    try std.testing.expectEqual(@as(?usize, null), try take_null("true", 0));
+    try std.testing.expectError(error.UnexpectedByte, take_null("nope", 0));
+}
+
+test "read_iso_date" {
+    const s = "\"timestamp\": \"2026-03-11T18:45:53Z\",";
+    const got = try read_iso_date(s, 0, "timestamp");
+    try std.testing.expectEqualStrings("2026-03-11T18:45:53Z", got.value);
+    try std.testing.expectEqual(@as(usize, 35), got.next);
 }
 
 test "mmap_file matches example-references.json + brace count" {

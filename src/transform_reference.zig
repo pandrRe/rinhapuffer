@@ -8,15 +8,12 @@ pub const N_FEATURES: usize = 14;
 /// `features` is a flat slice of length `N_FEATURES * n`. The k-th feature of
 /// record `r` is stored at `features[k * n + r]`, so each feature column is
 /// contiguous across all records — ideal for per-feature SIMD reductions.
+///
+/// Buffers are caller-owned. `Dataset` only holds aliasing views.
 pub const Dataset = struct {
     n: usize,
     features: []f32,
     labels: []bool,
-
-    pub fn deinit(self: *Dataset, allocator: std.mem.Allocator) void {
-        allocator.free(self.features);
-        allocator.free(self.labels);
-    }
 
     pub fn col(self: Dataset, c: usize) []f32 {
         return self.features[c * self.n .. (c + 1) * self.n];
@@ -27,109 +24,110 @@ pub const Dataset = struct {
     }
 };
 
-/// Load a reference dataset from `path` into a SoA `Dataset`.
-///
-/// mmaps the file, counts records via a SIMD '}' scan, then parses with a
-/// hand-rolled loop specialised for the
-/// `[{ "vector": [...14 f32...], "label": "..." }, ...]` shape.
-/// No general-purpose JSON parser is used.
-pub fn load_dataset(allocator: std.mem.Allocator, path: []const u8) !Dataset {
-    var mapped = try fast_json.mmap_file(path);
-    defer mapped.deinit();
-    const b = mapped.bytes;
+pub const Error = fast_json.ParseError || error{BufferTooSmall};
 
-    const n = fast_json.count_closing_braces(b);
-    if (n == 0) {
-        const empty_f = try allocator.alloc(f32, 0);
-        const empty_l = try allocator.alloc(bool, 0);
-        return .{ .n = 0, .features = empty_f, .labels = empty_l };
-    }
+/// Number of records in `bytes`. Use to size feature/label buffers
+/// before calling `parse_into`.
+pub inline fn count_records(bytes: []const u8) usize {
+    return fast_json.count_closing_braces(bytes);
+}
 
-    const features = try allocator.alloc(f32, N_FEATURES * n);
-    errdefer allocator.free(features);
-    const labels = try allocator.alloc(bool, n);
-    errdefer allocator.free(labels);
+/// Parse a reference-dataset JSON into caller-provided buffers. Writes
+/// `N_FEATURES * n` floats into `features_buf` (column-major) and `n`
+/// bools into `labels_buf`. Returns a `Dataset` whose slices alias the
+/// used prefixes of those buffers.
+pub fn parse_into(
+    bytes: []const u8,
+    features_buf: []f32,
+    labels_buf: []bool,
+) Error!Dataset {
+    const n = count_records(bytes);
+    if (features_buf.len < N_FEATURES * n) return error.BufferTooSmall;
+    if (labels_buf.len < n) return error.BufferTooSmall;
 
-    var p = fast_json.skip_ws(b, 0);
-    p = try fast_json.expect_byte(b, p, '[');
+    const features = features_buf[0 .. N_FEATURES * n];
+    const labels = labels_buf[0..n];
+
+    if (n == 0) return .{ .n = 0, .features = features, .labels = labels };
+
+    var p = fast_json.skip_ws(bytes, 0);
+    p = try fast_json.expect_byte(bytes, p, '[');
 
     var row: usize = 0;
     while (row < n) : (row += 1) {
-        p = fast_json.skip_ws(b, p);
-        p = try fast_json.expect_byte(b, p, '{');
-        p = fast_json.skip_ws(b, p);
-        if (p + 8 > b.len) return error.UnexpectedEof;
+        p = fast_json.skip_ws(bytes, p);
+        p = try fast_json.expect_byte(bytes, p, '{');
+        p = fast_json.skip_ws(bytes, p);
+        if (p + 8 > bytes.len) return error.UnexpectedEof;
         p += 8; // "vector"
-        p = fast_json.skip_ws(b, p);
-        p = try fast_json.expect_byte(b, p, ':');
-        p = fast_json.skip_ws(b, p);
-        p = try fast_json.expect_byte(b, p, '[');
+        p = fast_json.skip_ws(bytes, p);
+        p = try fast_json.expect_byte(bytes, p, ':');
+        p = fast_json.skip_ws(bytes, p);
+        p = try fast_json.expect_byte(bytes, p, '[');
 
         inline for (0..N_FEATURES) |k| {
-            p = fast_json.skip_ws(b, p);
-            const r = try fast_json.parse_f32_simple(b, p);
+            p = fast_json.skip_ws(bytes, p);
+            const r = try fast_json.parse_f32_simple(bytes, p);
             features[k * n + row] = r.value;
             p = r.next;
             if (k < N_FEATURES - 1) {
-                p = fast_json.skip_ws(b, p);
-                p = try fast_json.expect_byte(b, p, ',');
+                p = fast_json.skip_ws(bytes, p);
+                p = try fast_json.expect_byte(bytes, p, ',');
             }
         }
 
-        p = fast_json.skip_ws(b, p);
-        p = try fast_json.expect_byte(b, p, ']');
-        p = fast_json.skip_ws(b, p);
-        p = try fast_json.expect_byte(b, p, ',');
-        p = fast_json.skip_ws(b, p);
-        if (p + 7 > b.len) return error.UnexpectedEof;
+        p = fast_json.skip_ws(bytes, p);
+        p = try fast_json.expect_byte(bytes, p, ']');
+        p = fast_json.skip_ws(bytes, p);
+        p = try fast_json.expect_byte(bytes, p, ',');
+        p = fast_json.skip_ws(bytes, p);
+        if (p + 7 > bytes.len) return error.UnexpectedEof;
         p += 7; // "label"
-        p = fast_json.skip_ws(b, p);
-        p = try fast_json.expect_byte(b, p, ':');
-        p = fast_json.skip_ws(b, p);
-        p = try fast_json.expect_byte(b, p, '"');
-        if (p + 5 > b.len) return error.UnexpectedEof;
-        labels[row] = b[p] == 'f'; // 'f'raud vs 'l'egit
+        p = fast_json.skip_ws(bytes, p);
+        p = try fast_json.expect_byte(bytes, p, ':');
+        p = fast_json.skip_ws(bytes, p);
+        p = try fast_json.expect_byte(bytes, p, '"');
+        if (p + 5 > bytes.len) return error.UnexpectedEof;
+        labels[row] = bytes[p] == 'f'; // 'f'raud vs 'l'egit
         p += 5;
-        p = try fast_json.expect_byte(b, p, '"');
-        p = fast_json.skip_ws(b, p);
-        p = try fast_json.expect_byte(b, p, '}');
-        p = fast_json.skip_ws(b, p);
+        p = try fast_json.expect_byte(bytes, p, '"');
+        p = fast_json.skip_ws(bytes, p);
+        p = try fast_json.expect_byte(bytes, p, '}');
+        p = fast_json.skip_ws(bytes, p);
         if (row + 1 < n) {
-            p = try fast_json.expect_byte(b, p, ',');
+            p = try fast_json.expect_byte(bytes, p, ',');
         }
     }
 
-    p = fast_json.skip_ws(b, p);
-    p = try fast_json.expect_byte(b, p, ']');
+    p = fast_json.skip_ws(bytes, p);
+    p = try fast_json.expect_byte(bytes, p, ']');
 
     return .{ .n = n, .features = features, .labels = labels };
 }
 
-test "load reference dataset" {
+test "parse_into example references" {
     const allocator = std.testing.allocator;
-    var dataset = try load_dataset(allocator, "./resources/example-references.json");
-    defer dataset.deinit(allocator);
+
+    var mapped = try fast_json.mmap_file("./resources/example-references.json");
+    defer mapped.deinit();
+
+    const n = count_records(mapped.bytes);
+    const features = try allocator.alloc(f32, N_FEATURES * n);
+    defer allocator.free(features);
+    const labels = try allocator.alloc(bool, n);
+    defer allocator.free(labels);
+
+    const dataset = try parse_into(mapped.bytes, features, labels);
 
     try std.testing.expectEqual(@as(usize, 100), dataset.n);
     try std.testing.expectEqual(N_FEATURES * dataset.n, dataset.features.len);
     try std.testing.expectEqual(dataset.n, dataset.labels.len);
-
-    var fraud_count: usize = 0;
-    for (dataset.labels) |is_fraud| {
-        if (is_fraud) fraud_count += 1;
-    }
-    std.debug.print("\nloaded {} records, {} fraud, {} legit\n", .{
-        dataset.n,
-        fraud_count,
-        dataset.n - fraud_count,
-    });
 }
 
-test "load_dataset matches std.json on example-references.json" {
+test "parse_into matches std.json on example-references.json" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Reference parse using std.json — only used to validate the fast loader.
     const file = try std.Io.Dir.cwd().openFile(io, "./resources/example-references.json", .{});
     defer file.close(io);
     const st = try file.stat(io);
@@ -143,8 +141,13 @@ test "load_dataset matches std.json on example-references.json" {
     const parsed = try std.json.parseFromSlice([]Entry, allocator, contents, .{});
     defer parsed.deinit();
 
-    var dataset = try load_dataset(allocator, "./resources/example-references.json");
-    defer dataset.deinit(allocator);
+    const n = count_records(contents);
+    const features = try allocator.alloc(f32, N_FEATURES * n);
+    defer allocator.free(features);
+    const labels = try allocator.alloc(bool, n);
+    defer allocator.free(labels);
+
+    const dataset = try parse_into(contents, features, labels);
 
     try std.testing.expectEqual(parsed.value.len, dataset.n);
     for (parsed.value, 0..) |entry, row| {
@@ -155,4 +158,16 @@ test "load_dataset matches std.json on example-references.json" {
             try std.testing.expect(@abs(got_v - expected_v) <= 1.0e-6);
         }
     }
+}
+
+test "parse_into BufferTooSmall" {
+    var mapped = try fast_json.mmap_file("./resources/example-references.json");
+    defer mapped.deinit();
+
+    var tiny_features: [10]f32 = undefined;
+    var tiny_labels: [10]bool = undefined;
+    try std.testing.expectError(
+        error.BufferTooSmall,
+        parse_into(mapped.bytes, &tiny_features, &tiny_labels),
+    );
 }
