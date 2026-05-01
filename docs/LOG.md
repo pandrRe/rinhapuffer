@@ -108,3 +108,9 @@
   - 3.9: bench `dataset_blob.load` — warm 50 runs. **min 7 µs**, p50 8 µs, p99 24 µs, mean 8.4 µs. ~40,000× faster than the 330 ms `parse_into` path it replaces on the boot critical section. Other benches unchanged within noise: `parse_into` 305 ms warm min (still in bench for comparison), `cosine_topk` 3.25 ms warm min (≈922M rows/s), `payload.vectorize` 380 ns p50.
 - One commit landed
   - `feat: dataset.bin artifact + mmap-only runtime load`
+- Adapted `bench_cosine_topk` to consume `dataset.bin` via `dataset_blob.load` (was: `setup_reference_buffers` + `transform_reference.parse_into`). Bench setup goes from ~330 ms parse + 168 MB heap alloc to ~8 µs mmap, no alloc. Now mirrors the production runtime path; eliminates the bench's hidden dependency on `references.json` once `dataset.bin` exists.
+  - Reordered the bench sections: `dataset_blob.load` runs before `cosine_topk`. The load path is header-only so it doesn't pre-fault feature pages; running it first preserves the cold-cache measurement that matches the boot scenario. (First reorder produced a misleading 820 µs warm load — that was `munmap` walking 41k resident PTEs after `cosine_topk` had populated the page cache, not boot cost.)
+  - Probe consolidated: one `dataset_blob.load(DATASET_BIN_PATH)` probe at section start, both subsequent benches share it. Skip message updated to "run `zig build prep` first".
+  - Bench delta: `cosine_topk` warm min 3.31 ms, p99 4.55 ms, **906M rows/s** — within noise of parse-backed numbers (3.25 ms / 922M). Confirms file-mapped pages and anonymous heap perform identically once resident on Apple Silicon.
+- One commit landed
+  - `chore: bench cosine_topk via mmapped dataset.bin`
