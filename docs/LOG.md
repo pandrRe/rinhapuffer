@@ -96,3 +96,15 @@
 - Two commits landed
   - `docs: log phase 1 work` (carry-over)
   - `feat: l2-normalize dataset at parse, plain-dot search`
+- Phase 3 — `dataset.bin` build artifact + mmap-only runtime load
+  - 3.1: `src/dataset_blob.zig` — on-disk layout. 16-byte `extern struct` Header `{ magic: u32 = "RBP1" LE, version: u32 = 1, n: u32, _pad: u32 }`, then `N_FEATURES * n * 4` bytes of f32 column-major (L2-normalized) features, then `n` u8 labels (0=legit, 1=fraud). `blob_size(n) = 16 + 56n + n`. Native LE; cross-arch is out of scope (dev macOS arm64 + target x86_64 Linux are both LE).
+  - 3.2: `load(path) Blob` — `mmap_file` + header validation (magic / version / `bytes.len >= blob_size(n)`). No body parsing — kernel faults pages in lazily on first access. Returns a `transform_reference.Dataset` view aliasing the mapping. `Blob.deinit` munmaps.
+  - 3.3: `write(io, dir, sub_path, ds)` — streams the header, `std.mem.sliceAsBytes(ds.features)`, and a 4 KiB chunked bool→u8 conversion via `Io.File.writeStreamingAll`. Truncate-overwrite via `createFile(.{})`. `error.TooManyRecords` if `ds.n > maxInt(u32)`.
+  - 3.4: `Dataset.features: []f32 → []const f32`, `Dataset.labels: []bool → []const bool`. Type-level enforcement that nothing writes through an mmap-backed Dataset (mmap is PROT_READ; a write would SEGV). `parse_into` body unchanged — implicit `[]f32` → `[]const f32` coercion at struct-init. No call-site fallout in `search.zig` or `bench.zig`.
+  - 3.5: `src/build_dataset.zig` — `prep` exe. Reads `resources/references.json` via the fast loader, calls `parse_into`, writes `resources/dataset.bin`. Wired in `build.zig` as the `prep` step (ReleaseFast, since it parses 284 MB of JSON).
+  - 3.6: 5 new tests in `dataset_blob.zig`: write/load round-trip on `example-references.json` (asserts byte-equal features and labels), top-K equivalence (loaded blob ≡ in-memory ds for 3 queries), bad magic, unsupported version, truncated body. 42/42 tests pass.
+  - 3.7: deviations from `docs/PLAN.md` (confirmed with user): labels stored as `[n]u8` not bitset (2.6 MB defer; Phase 4 quantization is the real RAM win at 84 MB; bitset can land later as a localized change). Decision: it's not worth the API churn to `search.zig` tests / `bench.zig` / future `/fraud-score` handler for a 1.7% RAM win at this stage.
+  - 3.8: `zig build prep` produces `resources/dataset.bin` of exactly **171,000,016 bytes** (= 16 + 14 × 3M × 4 + 3M). Header dump verified: magic `0x31504252`, version `1`, n `3_000_000`, pad `0`.
+  - 3.9: bench `dataset_blob.load` — warm 50 runs. **min 7 µs**, p50 8 µs, p99 24 µs, mean 8.4 µs. ~40,000× faster than the 330 ms `parse_into` path it replaces on the boot critical section. Other benches unchanged within noise: `parse_into` 305 ms warm min (still in bench for comparison), `cosine_topk` 3.25 ms warm min (≈922M rows/s), `payload.vectorize` 380 ns p50.
+- One commit landed
+  - `feat: dataset.bin artifact + mmap-only runtime load`
