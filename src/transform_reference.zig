@@ -9,9 +9,10 @@ pub const N_FEATURES: usize = 14;
 /// record `r` is stored at `features[k * n + r]`, so each feature column is
 /// contiguous across all records — ideal for per-feature SIMD reductions.
 ///
-/// **Rows are L2-normalized**: `Σ_k features[k*n+r]² ≈ 1.0` for every row.
-/// `parse_into` establishes this invariant; `search.euclidean_topk` relies on it
-/// to skip the per-row divide.
+/// **Rows are raw [0,1] ∪ {−1}**: same value space as `payload.vectorize`'s
+/// output (per-feature normalized to [0,1] with a sentinel −1 for null
+/// `last_transaction` on features 5 and 6). No per-row L2 normalization —
+/// `search.euclidean_topk` computes plain Euclidean distance.
 ///
 /// Buffers are caller-owned. `Dataset` only holds aliasing views.
 pub const Dataset = struct {
@@ -41,8 +42,9 @@ pub const QuantizedDataset = struct {
 /// (so cluster `c` occupies `[cluster_starts[c], cluster_starts[c+1])` in
 /// every feature column), with `centroids` row-major over `[k_clusters][14]f32`.
 ///
-/// Search picks the top-N centroids by `dot(q, centroid)` then scans only
-/// those clusters' row slices. The u16 features and per-feature
+/// Search picks the top-N centroids by min Euclidean distance to the query
+/// (== max `dot(q, c) − ½‖c‖²`) then scans only those clusters' row slices
+/// with the same Euclidean ranking. The u16 features and per-feature
 /// `(min, inv_scale)` are identical in shape and meaning to `QuantizedDataset`.
 pub const IvfQuantizedDataset = struct {
     n: usize,
@@ -64,9 +66,10 @@ pub inline fn count_records(bytes: []const u8) usize {
 }
 
 /// Parse a reference-dataset JSON into caller-provided buffers. Writes
-/// `N_FEATURES * n` floats into `features_buf` (column-major, **L2-normalized
-/// per row**) and `n` bools into `labels_buf`. Returns a `Dataset` whose
-/// slices alias the used prefixes of those buffers.
+/// `N_FEATURES * n` floats into `features_buf` (column-major, **raw values
+/// in [0,1] ∪ {−1}** — same value space as `payload.vectorize`'s output)
+/// and `n` bools into `labels_buf`. Returns a `Dataset` whose slices alias
+/// the used prefixes of those buffers.
 pub fn parse_into(
     bytes: []const u8,
     features_buf: []f32,
@@ -96,26 +99,15 @@ pub fn parse_into(
         p = fast_json.skip_ws(bytes, p);
         p = try fast_json.expect_byte(bytes, p, '[');
 
-        // Stash 14 raw f32s in a stack array so they stay register-resident
-        // through the L2 normalization pass — avoids round-tripping through
-        // the stride-n column-major buffer twice.
-        var row_features: [N_FEATURES]f32 = undefined;
-        var sum_sq: f32 = 0;
         inline for (0..N_FEATURES) |k| {
             p = fast_json.skip_ws(bytes, p);
             const r = try fast_json.parse_f32_simple(bytes, p);
-            row_features[k] = r.value;
-            sum_sq += r.value * r.value;
+            features[k * n + row] = r.value;
             p = r.next;
             if (k < N_FEATURES - 1) {
                 p = fast_json.skip_ws(bytes, p);
                 p = try fast_json.expect_byte(bytes, p, ',');
             }
-        }
-        std.debug.assert(sum_sq > 0);
-        const inv_norm: f32 = 1.0 / @sqrt(sum_sq);
-        inline for (0..N_FEATURES) |k| {
-            features[k * n + row] = row_features[k] * inv_norm;
         }
 
         p = fast_json.skip_ws(bytes, p);
@@ -165,14 +157,17 @@ test "parse_into example references" {
     try std.testing.expectEqual(N_FEATURES * dataset.n, dataset.features.len);
     try std.testing.expectEqual(dataset.n, dataset.labels.len);
 
-    // Every row must be unit-norm post-parse (the Dataset invariant).
+    // Every value lives in [0, 1] except features 5 and 6 which can be the
+    // null-`last_transaction` sentinel −1.
     for (0..dataset.n) |row| {
-        var sum_sq: f64 = 0;
         for (0..N_FEATURES) |c| {
-            const v: f64 = dataset.features[c * dataset.n + row];
-            sum_sq += v * v;
+            const v = dataset.features[c * dataset.n + row];
+            if (c == 5 or c == 6) {
+                try std.testing.expect(v == -1.0 or (v >= 0.0 and v <= 1.0));
+            } else {
+                try std.testing.expect(v >= 0.0 and v <= 1.0);
+            }
         }
-        try std.testing.expect(@abs(sum_sq - 1.0) <= 1.0e-5);
     }
 }
 
@@ -206,15 +201,10 @@ test "parse_into matches std.json on example-references.json" {
         const expected_label = std.mem.eql(u8, entry.label, "fraud");
         try std.testing.expectEqual(expected_label, dataset.labels[row]);
 
-        // Compare against the std.json values after applying the same
-        // L2 normalization parse_into does.
-        var sum_sq: f64 = 0;
-        for (entry.vector) |v| sum_sq += @as(f64, v) * @as(f64, v);
-        const inv_norm: f64 = 1.0 / @sqrt(sum_sq);
+        // parse_into stores raw values from the JSON; compare directly.
         for (entry.vector, 0..) |expected_v, c| {
             const got_v = dataset.features[c * dataset.n + row];
-            const expected_norm: f32 = @floatCast(@as(f64, expected_v) * inv_norm);
-            try std.testing.expect(@abs(got_v - expected_norm) <= 1.0e-5);
+            try std.testing.expectEqual(expected_v, got_v);
         }
     }
 }

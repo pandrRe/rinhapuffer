@@ -158,15 +158,11 @@ fn parse_stdjson_into(
 
     const f = features[0 .. transform_reference.N_FEATURES * n];
     const l = labels[0..n];
-    // Mirror parse_into's L2-normalization so the std.json baseline produces
-    // an identical dataset shape and consumes the same memory.
+    // parse_into stores raw JSON values; the std.json baseline does the same.
     for (parsed.value, 0..) |entry, row| {
         l[row] = std.mem.eql(u8, entry.label, "fraud");
-        var sum_sq: f32 = 0;
-        for (entry.vector) |v| sum_sq += v * v;
-        const inv_norm: f32 = 1.0 / @sqrt(sum_sq);
         for (entry.vector, 0..) |v, c| {
-            f[c * n + row] = v * inv_norm;
+            f[c * n + row] = v;
         }
     }
 

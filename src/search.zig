@@ -1,16 +1,18 @@
-//! Cosine top-K search over a column-major SoA `Dataset`.
+//! Euclidean top-K search over a column-major SoA `Dataset`.
 //!
-//! Input invariant: dataset rows are L2-normalized (set up by
-//! `transform_reference.parse_into`). Given that, cosine top-K reduces to
-//! plain dot-product top-K — `|q|` is the same scalar for every row, so
-//! dividing by it is order-preserving and the top-K *indices* are identical.
-//! Score values stored internally are raw dot products, not cosines.
+//! Dataset rows are raw [0,1] ∪ {−1} values (per `transform_reference.parse_into`).
+//! Distance metric is Euclidean: rank rows by min `‖q − r‖²`. Since `‖q‖²` is
+//! row-constant for any given query, `‖q − r‖² = ‖q‖² + ‖r‖² − 2 q·r` ranks
+//! identically to **max `q·r − ½‖r‖²`** — that's what the inner loops compute,
+//! so the sift is a "max-of-rolling-min" with the largest score winning.
 //!
-//! Strategy: W rows in parallel via `@Vector(W, f32)`. For each batch the inner
-//! loop is `inline for (0..N_FEATURES)` of FMAs against query lanes broadcast
-//! once into vectors. A small ascending-sorted top-K array tracks the best
-//! matches seen so far — insertion-sift on each lane that beats the current
-//! minimum. Tail rows (`n % W != 0`) fall back to a scalar pass.
+//! Strategy: W rows in parallel via `@Vector(W, f32)`. For each batch, the
+//! inner loop is `inline for (0..N_FEATURES)` of FMAs that accumulate two
+//! quantities at once — the linear contribution `inv_s_k * (q_k − min_k) * r_f32`
+//! and the quadratic `−½ inv_s_k² * r_f32²`. Both share the same dequantized
+//! `r_f32` register so the only extra cost vs the pure-dot path is one mul +
+//! one fma per (row, feature) pair. Tail rows (`n % W != 0`) fall back to a
+//! scalar pass with the same algebra.
 
 const std = @import("std");
 const transform_reference = @import("transform_reference.zig");
@@ -22,16 +24,13 @@ const W: usize = 8;
 const Vec = @Vector(W, f32);
 const Vu16 = @Vector(W, u16);
 
-/// Find the indices of the `TOP_K` rows with the highest cosine similarity to `q`.
+/// Find the indices of the `TOP_K` rows nearest to `q` in raw-feature
+/// Euclidean distance. `out[0]` is the closest row, `out[TOP_K - 1]` the
+/// K-th. Score ties are broken by lower row index winning.
 ///
-/// `out[0]` is the closest row, `out[TOP_K - 1]` the K-th. Score ties are
-/// broken by lower row index winning (insertion-order — first to reach a
-/// given score keeps its slot).
-///
-/// Requires `ds.n >= TOP_K` and dataset rows L2-normalized (the post-condition
-/// of `transform_reference.parse_into`). The query `q` may have any norm; the
-/// returned indices are correct cosine top-K since `|q|` is constant across
-/// the scan and dividing by it is order-preserving.
+/// Requires `ds.n >= TOP_K`. Internal score is `q·r − ½‖r‖²` (the `½‖q‖²`
+/// constant drops from row-vs-row ranking); largest score == smallest
+/// Euclidean distance.
 pub fn euclidean_topk(
     ds: transform_reference.Dataset,
     q: *const [N_FEATURES]f32,
@@ -41,6 +40,7 @@ pub fn euclidean_topk(
 
     var q_vec: [N_FEATURES]Vec = undefined;
     inline for (0..N_FEATURES) |k| q_vec[k] = @splat(q[k]);
+    const half_vec: Vec = @splat(0.5);
 
     // Top-K kept ascending: top_scores[0] is the smallest of the current best.
     // Initialise with -inf so the first TOP_K rows always displace the sentinel.
@@ -53,13 +53,16 @@ pub fn euclidean_topk(
     var row: usize = 0;
     while (row + W <= n) : (row += W) {
         var dot: Vec = @splat(0);
+        var norm_sq: Vec = @splat(0);
         inline for (0..N_FEATURES) |k| {
             const r_chunk: Vec = features[k * n + row ..][0..W].*;
             dot = @mulAdd(Vec, q_vec[k], r_chunk, dot);
+            norm_sq = @mulAdd(Vec, r_chunk, r_chunk, norm_sq);
         }
+        const score: Vec = dot - half_vec * norm_sq;
 
         inline for (0..W) |lane| {
-            const s = dot[lane];
+            const s = score[lane];
             if (s > top_scores[0]) {
                 sift_in(&top_scores, &top_rows, s, @intCast(row + lane));
             }
@@ -68,11 +71,15 @@ pub fn euclidean_topk(
 
     while (row < n) : (row += 1) {
         var dot: f32 = 0;
+        var norm_sq: f32 = 0;
         inline for (0..N_FEATURES) |k| {
-            dot = @mulAdd(f32, q[k], features[k * n + row], dot);
+            const v = features[k * n + row];
+            dot = @mulAdd(f32, q[k], v, dot);
+            norm_sq = @mulAdd(f32, v, v, norm_sq);
         }
-        if (dot > top_scores[0]) {
-            sift_in(&top_scores, &top_rows, dot, @intCast(row));
+        const s = dot - 0.5 * norm_sq;
+        if (s > top_scores[0]) {
+            sift_in(&top_scores, &top_rows, s, @intCast(row));
         }
     }
 
@@ -80,17 +87,23 @@ pub fn euclidean_topk(
     inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
 }
 
-/// Cosine top-K over a `QuantizedDataset` (u16 features, per-feature
-/// `(min, inv_scale)`). Algebraically equivalent to `euclidean_topk`:
+/// Euclidean top-K over a `QuantizedDataset` (u16 features, per-feature
+/// `(min, inv_scale)`). Score per row:
 ///
 /// ```
-/// dot = Σ q[k] * (r_u16[k] * inv_scale[k] + min[k])
-///     = Σ q[k] * min[k]                 // const_q, computed once per query
-///       + Σ (q[k] * inv_scale[k]) * r_u16[k]   // q_eff[k] folded once per query
+/// r_k       = r_f32_k * inv_s_k + min_k        (dequantization)
+/// q·r       = const_q + Σ q_eff_k * r_f32_k    where q_eff_k = q_k * inv_s_k
+///                                                    const_q = Σ q_k * min_k
+/// ½‖r‖²     = ½ Σ inv_s_k² * r_f32_k² + Σ inv_s_k*min_k * r_f32_k + ½ Σ min_k²
+/// score     = q·r − ½‖r‖²
+///           = (const_q − ½ Σ min_k²)             score_const   (per-query scalar)
+///             + Σ inv_s_k*(q_k − min_k) * r_f32  lin_eff[k]    (vec splat per k)
+///             − ½ Σ inv_s_k² * r_f32²            half_quad[k]  (vec splat per k)
 /// ```
 ///
-/// So the inner per-row work is one `@floatFromInt(Vu16) -> Vec` convert and
-/// one FMA per feature — no per-row affine reconstruction.
+/// Inner loop dequant is the `@floatFromInt(Vu16) -> Vec` convert (same as the
+/// pure-dot path); the new work is a `r_f32 * r_f32` plus one extra FMA against
+/// `−half_quad[k]`. Largest score wins (== smallest Euclidean distance).
 pub fn euclidean_topk_q(
     qds: transform_reference.QuantizedDataset,
     q: *const [N_FEATURES]f32,
@@ -98,12 +111,17 @@ pub fn euclidean_topk_q(
 ) void {
     std.debug.assert(qds.n >= TOP_K);
 
+    var lin_eff: [N_FEATURES]Vec = undefined;
+    var neg_half_quad: [N_FEATURES]Vec = undefined;
     var const_q: f32 = 0;
-    var q_eff: [N_FEATURES]Vec = undefined;
+    var sum_min_sq: f32 = 0;
     inline for (0..N_FEATURES) |k| {
+        lin_eff[k] = @splat(qds.inv_scales[k] * (q[k] - qds.mins[k]));
+        neg_half_quad[k] = @splat(-0.5 * qds.inv_scales[k] * qds.inv_scales[k]);
         const_q += q[k] * qds.mins[k];
-        q_eff[k] = @splat(q[k] * qds.inv_scales[k]);
+        sum_min_sq += qds.mins[k] * qds.mins[k];
     }
+    const score_const: f32 = const_q - 0.5 * sum_min_sq;
 
     var top_scores: [TOP_K]f32 = @splat(-std.math.inf(f32));
     var top_rows: [TOP_K]u32 = @splat(0);
@@ -113,15 +131,17 @@ pub fn euclidean_topk_q(
 
     var row: usize = 0;
     while (row + W <= n) : (row += W) {
-        var dot: Vec = @splat(const_q);
+        var score: Vec = @splat(score_const);
         inline for (0..N_FEATURES) |k| {
             const r_u16: Vu16 = features[k * n + row ..][0..W].*;
             const r_f32: Vec = @floatFromInt(r_u16);
-            dot = @mulAdd(Vec, q_eff[k], r_f32, dot);
+            score = @mulAdd(Vec, lin_eff[k], r_f32, score);
+            const r_sq: Vec = r_f32 * r_f32;
+            score = @mulAdd(Vec, neg_half_quad[k], r_sq, score);
         }
 
         inline for (0..W) |lane| {
-            const s = dot[lane];
+            const s = score[lane];
             if (s > top_scores[0]) {
                 sift_in(&top_scores, &top_rows, s, @intCast(row + lane));
             }
@@ -129,13 +149,16 @@ pub fn euclidean_topk_q(
     }
 
     while (row < n) : (row += 1) {
-        var dot: f32 = const_q;
+        var s: f32 = score_const;
         inline for (0..N_FEATURES) |k| {
             const r_f32: f32 = @floatFromInt(features[k * n + row]);
-            dot = @mulAdd(f32, q[k] * qds.inv_scales[k], r_f32, dot);
+            const lin_w: f32 = qds.inv_scales[k] * (q[k] - qds.mins[k]);
+            const neg_half_w: f32 = -0.5 * qds.inv_scales[k] * qds.inv_scales[k];
+            s = @mulAdd(f32, lin_w, r_f32, s);
+            s = @mulAdd(f32, neg_half_w, r_f32 * r_f32, s);
         }
-        if (dot > top_scores[0]) {
-            sift_in(&top_scores, &top_rows, dot, @intCast(row));
+        if (s > top_scores[0]) {
+            sift_in(&top_scores, &top_rows, s, @intCast(row));
         }
     }
 
@@ -188,9 +211,34 @@ inline fn sift_in_n(
 const MAX_K_CLUSTERS: usize = 1024;
 const PROBE_CLUSTERS: usize = 8;
 
-/// Production IVF cosine top-K. Score query against all centroids, pick the
-/// top-`PROBE_CLUSTERS` by score, scan only those slabs with the Phase 4
-/// dot-product algebra.
+/// Per-query precompute used by both the centroid scoring and the row scan.
+const QueryPlan = struct {
+    score_const: f32,
+    lin_eff: [N_FEATURES]Vec,
+    neg_half_quad: [N_FEATURES]Vec,
+};
+
+inline fn build_plan(
+    q: *const [N_FEATURES]f32,
+    mins: [N_FEATURES]f32,
+    inv_scales: [N_FEATURES]f32,
+) QueryPlan {
+    var plan: QueryPlan = undefined;
+    var const_q: f32 = 0;
+    var sum_min_sq: f32 = 0;
+    inline for (0..N_FEATURES) |k| {
+        plan.lin_eff[k] = @splat(inv_scales[k] * (q[k] - mins[k]));
+        plan.neg_half_quad[k] = @splat(-0.5 * inv_scales[k] * inv_scales[k]);
+        const_q += q[k] * mins[k];
+        sum_min_sq += mins[k] * mins[k];
+    }
+    plan.score_const = const_q - 0.5 * sum_min_sq;
+    return plan;
+}
+
+/// Production IVF Euclidean top-K. Score query against all centroids by
+/// `q·c − ½‖c‖²` (== −½‖q − c‖² up to row-constant), pick the top-`PROBE_CLUSTERS`
+/// by score, scan only those slabs with the same Euclidean ranking.
 pub fn euclidean_topk_q_ivf(
     qds: transform_reference.IvfQuantizedDataset,
     q: *const [N_FEATURES]f32,
@@ -200,17 +248,20 @@ pub fn euclidean_topk_q_ivf(
     std.debug.assert(qds.k_clusters <= MAX_K_CLUSTERS);
     std.debug.assert(qds.k_clusters >= PROBE_CLUSTERS);
 
-    // Step 1: dot(q, centroid[c]) for every c.
+    // Step 1: score q against every centroid by `q·c − ½‖c‖²`.
     var centroid_scores: [MAX_K_CLUSTERS]f32 = undefined;
     for (0..qds.k_clusters) |c| {
         var dot: f32 = 0;
+        var ss: f32 = 0;
         inline for (0..N_FEATURES) |k| {
-            dot = @mulAdd(f32, q[k], qds.centroids[c * N_FEATURES + k], dot);
+            const cv = qds.centroids[c * N_FEATURES + k];
+            dot = @mulAdd(f32, q[k], cv, dot);
+            ss = @mulAdd(f32, cv, cv, ss);
         }
-        centroid_scores[c] = dot;
+        centroid_scores[c] = dot - 0.5 * ss;
     }
 
-    // Step 2: top-PROBE_CLUSTERS clusters by score (ascending sift).
+    // Step 2: top-PROBE_CLUSTERS clusters by score (largest wins == closest).
     var probe_scores: [PROBE_CLUSTERS]f32 = @splat(-std.math.inf(f32));
     var probe_clusters: [PROBE_CLUSTERS]u32 = @splat(0);
     for (0..qds.k_clusters) |c| {
@@ -220,7 +271,8 @@ pub fn euclidean_topk_q_ivf(
     }
 
     // Step 3: scan rows in selected clusters.
-    scan_clusters(qds, q, probe_clusters[0..], out);
+    const plan = build_plan(q, qds.mins, qds.inv_scales);
+    scan_clusters(qds, plan, probe_clusters[0..], out);
 }
 
 /// Test-only: scan every cluster (PROBE = K). Used by `dataset_blob.zig`
@@ -234,12 +286,7 @@ pub fn euclidean_topk_q_ivf_full(
 ) void {
     std.debug.assert(qds.n >= TOP_K);
 
-    var const_q: f32 = 0;
-    var q_eff: [N_FEATURES]Vec = undefined;
-    inline for (0..N_FEATURES) |k| {
-        const_q += q[k] * qds.mins[k];
-        q_eff[k] = @splat(q[k] * qds.inv_scales[k]);
-    }
+    const plan = build_plan(q, qds.mins, qds.inv_scales);
 
     var top_scores: [TOP_K]f32 = @splat(-std.math.inf(f32));
     var top_rows: [TOP_K]u32 = @splat(0);
@@ -250,7 +297,7 @@ pub fn euclidean_topk_q_ivf_full(
     for (0..qds.k_clusters) |c| {
         const start = qds.cluster_starts[c];
         const end = qds.cluster_starts[c + 1];
-        scan_one(features, n, start, end, const_q, q_eff, q, qds.inv_scales, &top_scores, &top_rows);
+        scan_one(features, n, start, end, plan, &top_scores, &top_rows);
     }
 
     inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
@@ -258,17 +305,10 @@ pub fn euclidean_topk_q_ivf_full(
 
 inline fn scan_clusters(
     qds: transform_reference.IvfQuantizedDataset,
-    q: *const [N_FEATURES]f32,
+    plan: QueryPlan,
     cluster_ids: []const u32,
     out: *[TOP_K]u32,
 ) void {
-    var const_q: f32 = 0;
-    var q_eff: [N_FEATURES]Vec = undefined;
-    inline for (0..N_FEATURES) |k| {
-        const_q += q[k] * qds.mins[k];
-        q_eff[k] = @splat(q[k] * qds.inv_scales[k]);
-    }
-
     var top_scores: [TOP_K]f32 = @splat(-std.math.inf(f32));
     var top_rows: [TOP_K]u32 = @splat(0);
 
@@ -278,7 +318,7 @@ inline fn scan_clusters(
     for (cluster_ids) |c| {
         const start = qds.cluster_starts[c];
         const end = qds.cluster_starts[c + 1];
-        scan_one(features, n, start, end, const_q, q_eff, q, qds.inv_scales, &top_scores, &top_rows);
+        scan_one(features, n, start, end, plan, &top_scores, &top_rows);
     }
 
     inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
@@ -289,33 +329,34 @@ inline fn scan_one(
     n: usize,
     start: u32,
     end: u32,
-    const_q: f32,
-    q_eff: [N_FEATURES]Vec,
-    q: *const [N_FEATURES]f32,
-    inv_scales: [N_FEATURES]f32,
+    plan: QueryPlan,
     top_scores: *[TOP_K]f32,
     top_rows: *[TOP_K]u32,
 ) void {
     var row: usize = start;
     while (row + W <= end) : (row += W) {
-        var dot: Vec = @splat(const_q);
+        var score: Vec = @splat(plan.score_const);
         inline for (0..N_FEATURES) |k| {
             const r_u16: Vu16 = features[k * n + row ..][0..W].*;
             const r_f32: Vec = @floatFromInt(r_u16);
-            dot = @mulAdd(Vec, q_eff[k], r_f32, dot);
+            score = @mulAdd(Vec, plan.lin_eff[k], r_f32, score);
+            const r_sq: Vec = r_f32 * r_f32;
+            score = @mulAdd(Vec, plan.neg_half_quad[k], r_sq, score);
         }
         inline for (0..W) |lane| {
-            const s = dot[lane];
+            const s = score[lane];
             if (s > top_scores[0]) sift_in(top_scores, top_rows, s, @intCast(row + lane));
         }
     }
     while (row < end) : (row += 1) {
-        var dot: f32 = const_q;
+        var s: f32 = plan.score_const;
         inline for (0..N_FEATURES) |k| {
             const r_f32: f32 = @floatFromInt(features[k * n + row]);
-            dot = @mulAdd(f32, q[k] * inv_scales[k], r_f32, dot);
+            // Splat[0] re-extracts the scalar; comptime-folded by LLVM.
+            s = @mulAdd(f32, plan.lin_eff[k][0], r_f32, s);
+            s = @mulAdd(f32, plan.neg_half_quad[k][0], r_f32 * r_f32, s);
         }
-        if (dot > top_scores[0]) sift_in(top_scores, top_rows, dot, @intCast(row));
+        if (s > top_scores[0]) sift_in(top_scores, top_rows, s, @intCast(row));
     }
 }
 
@@ -383,40 +424,33 @@ test "euclidean_topk SIMD-tail: rows just past a W boundary" {
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4 }, &out);
 }
 
-/// Naive O(n log n) reference: compute every cosine, sort all, return top-K.
-/// Computes `|r|` independently in f64 — does **not** trust the dataset's
-/// unit-norm post-condition. That way this differential test catches
-/// regressions in either `parse_into`'s normalization or `euclidean_topk`'s math.
+/// Naive O(n log n) reference: compute every Euclidean distance² in f64 over
+/// the raw features, sort ascending by distance, return top-K. Independent
+/// implementation so the differential test catches any regression in
+/// `euclidean_topk`'s SIMD math.
 fn naive_euclidean_topk(
     allocator: std.mem.Allocator,
     ds: transform_reference.Dataset,
     q: *const [N_FEATURES]f32,
 ) ![TOP_K]u32 {
-    const Score = struct { score: f32, row: u32 };
+    const Score = struct { dist: f64, row: u32 };
     const scores = try allocator.alloc(Score, ds.n);
     defer allocator.free(scores);
 
-    var q_sum_sq: f64 = 0;
-    for (q) |v| q_sum_sq += @as(f64, v) * @as(f64, v);
-    const q_norm: f64 = @sqrt(q_sum_sq);
-
     for (0..ds.n) |row| {
-        var dot: f64 = 0;
-        var r_sum_sq: f64 = 0;
+        var d: f64 = 0;
         for (0..N_FEATURES) |k| {
             const v: f64 = ds.features[k * ds.n + row];
-            dot += v * @as(f64, q[k]);
-            r_sum_sq += v * v;
+            const diff = @as(f64, q[k]) - v;
+            d += diff * diff;
         }
-        const r_norm: f64 = @sqrt(r_sum_sq);
-        const s: f32 = @floatCast(dot / (q_norm * r_norm));
-        scores[row] = .{ .score = s, .row = @intCast(row) };
+        scores[row] = .{ .dist = d, .row = @intCast(row) };
     }
 
     const cmp = struct {
         fn lt(_: void, a: Score, b: Score) bool {
-            // Descending by score; ties broken by row asc to be deterministic.
-            if (a.score != b.score) return a.score > b.score;
+            // Ascending by distance; ties broken by row asc to be deterministic.
+            if (a.dist != b.dist) return a.dist < b.dist;
             return a.row < b.row;
         }
     }.lt;

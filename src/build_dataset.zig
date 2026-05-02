@@ -1,5 +1,6 @@
-//! Build-time tool: parse `resources/references.json`, L2-normalize, write
-//! `resources/dataset.bin`. Wired in `build.zig` as the `prep` step.
+//! Build-time tool: parse `resources/references.json` into raw [0,1] ∪ {−1}
+//! values, run plain Euclidean k-means + IVF reordering + u16 quantization,
+//! write `resources/dataset.bin` (v4). Wired in `build.zig` as the `prep` step.
 //!
 //! Run with `zig build prep`. Re-run whenever `references.json` changes.
 

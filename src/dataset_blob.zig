@@ -1,7 +1,10 @@
 //! On-disk format for the prepped reference dataset, plus mmap-only `load`
 //! and `write` (used by the `prep` build step).
 //!
-//! Layout v3 (little-endian, native f32 IEEE 754):
+//! Layout v4 (little-endian, native f32 IEEE 754). Bytes identical to v3;
+//! the version bump signals that the u16 features now decode to **raw**
+//! [0,1] ∪ {−1} values (matching `payload.vectorize`'s output) rather than
+//! L2-normalized values. Search consumes them via plain Euclidean distance.
 //!
 //!     offset                         size                          field
 //!     0                              4                             magic = "RBP1"
@@ -34,7 +37,7 @@ const kmeans = @import("kmeans.zig");
 const N_FEATURES = transform_reference.N_FEATURES;
 
 pub const MAGIC: u32 = std.mem.readInt(u32, "RBP1", .little);
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// Production cluster count. Persisted in the header so loaders can reject
 /// blobs built with a different topology (`error.UnsupportedKClusters`).
@@ -250,7 +253,7 @@ pub fn load_unquant(allocator: std.mem.Allocator, path: []const u8) !UnquantBlob
 /// Serialize a Dataset to `<dir>/<sub_path>`, truncating an existing file.
 /// Runs the full IVF prep pipeline:
 ///   1. compute per-column quantization params from the in-memory f32 rows
-///   2. draw a random sample, run spherical k-means → centroids
+///   2. draw a random sample, run plain Euclidean k-means → centroids
 ///   3. assign every row to its nearest centroid
 ///   4. counting-sort permutation grouping rows by cluster
 ///   5. write header + centroids + cluster_starts + (quantized, permuted)
@@ -308,7 +311,9 @@ pub fn write(
     // 2. Assign every row to its cluster.
     const assignments = try allocator.alloc(u32, n);
     defer allocator.free(assignments);
-    kmeans.assign_all(ds.features, n, k_clusters, centroids, assignments);
+    const assign_scratch = try allocator.alloc(f32, k_clusters);
+    defer allocator.free(assign_scratch);
+    kmeans.assign_all(ds.features, n, k_clusters, centroids, assignments, assign_scratch);
 
     // 3. Counting sort: cluster_starts[c] = first new_idx of cluster c.
     const cluster_starts = try allocator.alloc(u32, @as(usize, k_clusters) + 1);
@@ -648,7 +653,7 @@ test "load rejects unsupported version" {
 }
 
 test "load rejects v2 (old format)" {
-    // Simulates a stale v2 dataset.bin sitting in resources/. v3 reader must
+    // Simulates a stale v2 dataset.bin sitting in resources/. v4 reader must
     // reject it via the version check.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -670,6 +675,34 @@ test "load rejects v2 (old format)" {
     }
 
     const path = try tmp_abs_path(allocator, &tmp, "v2.bin");
+    defer allocator.free(path);
+    try std.testing.expectError(error.UnsupportedVersion, load(path));
+}
+
+test "load rejects v3 (cosine-normalized format)" {
+    // v3 blobs have the same byte layout as v4 but the u16 cells decode to
+    // L2-normalized values. Mixing them with v4-aware search would give wrong
+    // neighbours silently — version check is the safety net.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var f = try tmp.dir.createFile(io, "v3.bin", .{});
+        defer f.close(io);
+        const hdr: Header = .{
+            .magic = MAGIC,
+            .version = 3,
+            .n = 0,
+            .k_clusters = K_CLUSTERS,
+            .quant_params = @splat(.{ .min = 0, .scale = 0 }),
+        };
+        try f.writeStreamingAll(io, std.mem.asBytes(&hdr));
+    }
+
+    const path = try tmp_abs_path(allocator, &tmp, "v3.bin");
     defer allocator.free(path);
     try std.testing.expectError(error.UnsupportedVersion, load(path));
 }

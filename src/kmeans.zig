@@ -1,9 +1,11 @@
-//! Spherical k-means for the IVF index.
+//! Plain Euclidean k-means for the IVF index.
 //!
-//! Inputs are unit-norm rows in SoA layout (`features[k * n + row]`).
-//! "Spherical" means similarity = cosine = dot product (since rows are
-//! unit-norm); the centroid update is a sum-then-renormalize, with no division
-//! by count for direction. Empty clusters reseed from a random sample row.
+//! Inputs are raw rows in SoA layout (`features[k * n + row]`) — same value
+//! space as `transform_reference.parse_into`'s output. Distance is Euclidean
+//! (`Σ (row − centroid)²`); ranking is `argmin dist²` == `argmax (row·c − ½‖c‖²)`
+//! with the per-centroid `½‖c‖²` precomputed once per iteration. The centroid
+//! update is the per-cluster mean. Empty clusters reseed from a random sample
+//! row.
 //!
 //! Determinism: same `seed` + same input ⇒ bit-identical centroids and
 //! assignments. Argmax tiebreak is "lowest cluster index wins", and the
@@ -15,11 +17,12 @@ const transform_reference = @import("transform_reference.zig");
 const N_FEATURES = transform_reference.N_FEATURES;
 
 /// Initialise centroids from a random sample of rows, then alternate
-/// assign/sum/renormalize for `n_iter` iterations. Final centroids land in
-/// `centroids_out` (row-major, `[c * N_FEATURES + k]`).
+/// assign-by-min-Euclidean / sum / mean for `n_iter` iterations. Final
+/// centroids land in `centroids_out` (row-major, `[c * N_FEATURES + k]`).
 ///
 /// Allocates: `[k_clusters * N_FEATURES]f32` sums + `[k_clusters]u32` counts +
-/// `[n_sample]u32` assignments + `[n_sample]u32` shuffle scratch.
+/// `[n_sample]u32` assignments + `[n_sample]u32` shuffle scratch +
+/// `[k_clusters]f32` half-norm-sq cache.
 pub fn run_kmeans(
     allocator: std.mem.Allocator,
     sample_features_soa: []const f32,
@@ -55,9 +58,23 @@ pub fn run_kmeans(
     defer allocator.free(sums);
     const counts = try allocator.alloc(u32, k_clusters);
     defer allocator.free(counts);
+    const half_norm_sq = try allocator.alloc(f32, k_clusters);
+    defer allocator.free(half_norm_sq);
 
     for (0..n_iter) |_| {
-        // Assign: argmax dot vs all K centroids, tiebreak lowest index.
+        // Per-iteration cache: ½‖c‖² for every centroid. Lets the assign loop
+        // rank by `argmax (row·c − ½‖c‖²)` (== argmin Euclidean distance)
+        // without recomputing the centroid norm for every (row, centroid) pair.
+        for (0..k_clusters) |c| {
+            var ss: f32 = 0;
+            inline for (0..N_FEATURES) |k| {
+                const v = centroids_out[c * N_FEATURES + k];
+                ss += v * v;
+            }
+            half_norm_sq[c] = 0.5 * ss;
+        }
+
+        // Assign: argmax (row·c − ½‖c‖²), tiebreak lowest cluster index.
         for (0..n_sample) |row| {
             var best: f32 = -std.math.inf(f32);
             var best_c: u32 = 0;
@@ -71,8 +88,9 @@ pub fn run_kmeans(
                         dot,
                     );
                 }
-                if (dot > best) {
-                    best = dot;
+                const score = dot - half_norm_sq[c];
+                if (score > best) {
+                    best = score;
                     best_c = @intCast(c);
                 }
             }
@@ -90,7 +108,7 @@ pub fn run_kmeans(
             }
         }
 
-        // Update: empty → reseed from random sample row; else L2-normalize sum.
+        // Update: empty → reseed from random sample row; else mean of cluster.
         for (0..k_clusters) |c| {
             if (counts[c] == 0) {
                 const r = rand.uintLessThan(usize, n_sample);
@@ -99,32 +117,40 @@ pub fn run_kmeans(
                 }
                 continue;
             }
-            var sum_sq: f32 = 0;
+            const inv_count: f32 = 1.0 / @as(f32, @floatFromInt(counts[c]));
             inline for (0..N_FEATURES) |k| {
-                const v = sums[c * N_FEATURES + k];
-                sum_sq += v * v;
-            }
-            // sum_sq > 0 since at least one unit-norm row contributed.
-            const inv_norm: f32 = 1.0 / @sqrt(sum_sq);
-            inline for (0..N_FEATURES) |k| {
-                centroids_out[c * N_FEATURES + k] = sums[c * N_FEATURES + k] * inv_norm;
+                centroids_out[c * N_FEATURES + k] = sums[c * N_FEATURES + k] * inv_count;
             }
         }
     }
 }
 
-/// Argmax-dot assignment of every row in `features_soa` against `centroids`.
-/// Tiebreak: lowest centroid index wins. Writes one u32 per row.
+/// Argmin-Euclidean assignment of every row in `features_soa` against
+/// `centroids`. Tiebreak: lowest centroid index wins. Writes one u32 per row.
+/// Caller-owned scratch buffer `half_norm_sq_scratch` of length `k_clusters`
+/// is populated upfront with `½‖c‖²` so the inner loop only does one dot per
+/// (row, centroid) pair.
 pub fn assign_all(
     features_soa: []const f32,
     n: usize,
     k_clusters: usize,
     centroids: []const f32,
     assignments_out: []u32,
+    half_norm_sq_scratch: []f32,
 ) void {
     std.debug.assert(features_soa.len == N_FEATURES * n);
     std.debug.assert(centroids.len == k_clusters * N_FEATURES);
     std.debug.assert(assignments_out.len == n);
+    std.debug.assert(half_norm_sq_scratch.len == k_clusters);
+
+    for (0..k_clusters) |c| {
+        var ss: f32 = 0;
+        inline for (0..N_FEATURES) |k| {
+            const v = centroids[c * N_FEATURES + k];
+            ss += v * v;
+        }
+        half_norm_sq_scratch[c] = 0.5 * ss;
+    }
 
     for (0..n) |row| {
         var best: f32 = -std.math.inf(f32);
@@ -139,8 +165,9 @@ pub fn assign_all(
                     dot,
                 );
             }
-            if (dot > best) {
-                best = dot;
+            const score = dot - half_norm_sq_scratch[c];
+            if (score > best) {
+                best = score;
                 best_c = @intCast(c);
             }
         }
@@ -289,8 +316,10 @@ test "assign_all tags every row exactly once and uses valid cluster ids" {
 
     const assignments = try allocator.alloc(u32, n);
     defer allocator.free(assignments);
+    const half_norm_sq = try allocator.alloc(f32, k);
+    defer allocator.free(half_norm_sq);
 
-    assign_all(features, n, k, centroids, assignments);
+    assign_all(features, n, k, centroids, assignments, half_norm_sq);
 
     for (assignments) |a| try std.testing.expect(a < k);
 
