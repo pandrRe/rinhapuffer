@@ -75,78 +75,11 @@ inline fn quantize_query(q: *const [N_FEATURES]f32, out: *[N_FEATURES]i16) void 
 }
 
 // ─── public search API ────────────────────────────────────────────────────
-
-/// Find the indices of the `TOP_K` rows nearest to `q` in raw-feature
-/// Euclidean distance, against a non-quantized f32 dataset.
-///
-/// Test/reference path — production uses `euclidean_topk_q_ivf`.
-pub fn euclidean_topk(
-    ds: transform_reference.Dataset,
-    q: *const [N_FEATURES]f32,
-    out: *[TOP_K]u32,
-) void {
-    std.debug.assert(ds.n >= TOP_K);
-
-    var q_vec: [N_FEATURES]Vec = undefined;
-    inline for (0..N_FEATURES) |k| q_vec[k] = @splat(q[k]);
-
-    // Top-K kept descending by distance: top_dists[0] is the LARGEST current.
-    var top_dists: [TOP_K]f32 = @splat(std.math.inf(f32));
-    var top_rows: [TOP_K]u32 = @splat(0);
-
-    const n = ds.n;
-    const features = ds.features;
-
-    var row: usize = 0;
-    while (row + W <= n) : (row += W) {
-        var dist: Vec = @splat(0);
-        inline for (0..N_FEATURES) |k| {
-            const r_chunk: Vec = features[k * n + row ..][0..W].*;
-            const diff = q_vec[k] - r_chunk;
-            dist += diff * diff;
-        }
-        inline for (0..W) |lane| {
-            const d = dist[lane];
-            if (d < top_dists[0]) {
-                sift_in_min_f32(&top_dists, &top_rows, d, @intCast(row + lane));
-            }
-        }
-    }
-
-    while (row < n) : (row += 1) {
-        var dist: f32 = 0;
-        inline for (0..N_FEATURES) |k| {
-            const v = features[k * n + row];
-            const diff = q[k] - v;
-            dist += diff * diff;
-        }
-        if (dist < top_dists[0]) {
-            sift_in_min_f32(&top_dists, &top_rows, dist, @intCast(row));
-        }
-    }
-
-    // Reverse: emit ascending by distance so out[0] is the closest.
-    inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
-}
-
-/// Brute-force int top-K over an i16-quantized dataset.
-pub fn euclidean_topk_q(
-    qds: transform_reference.QuantizedDataset,
-    q: *const [N_FEATURES]f32,
-    out: *[TOP_K]u32,
-) void {
-    std.debug.assert(qds.n >= TOP_K);
-
-    var q_int: [N_FEATURES]i16 = undefined;
-    quantize_query(q, &q_int);
-
-    var top_dists: [TOP_K]i64 = @splat(std.math.maxInt(i64));
-    var top_rows: [TOP_K]u32 = @splat(0);
-
-    scan_range_int(qds.features, qds.n, 0, @intCast(qds.n), &q_int, &top_dists, &top_rows);
-
-    inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
-}
+//
+// Production hot path is `euclidean_topk_q_ivf` only. The other public
+// `euclidean_topk*` functions live below the `// ─── reference / bench-only
+// paths ───` banner — they exist for the differential tests and `bench.zig`,
+// not for prod.
 
 /// Production IVF Euclidean top-K — **exact** by bbox-repair construction.
 ///
@@ -181,53 +114,50 @@ pub fn euclidean_topk_q_ivf(
     }
 
     // Step 2: select PROBE clusters with smallest centroid distance via a
-    // max-heap of size PROBE. ~10× cheaper than pdq-sorting all 1024 entries
-    // when we only need the smallest 8 in distance order. The remaining
-    // K - PROBE clusters are NOT sorted — they get walked unsorted in the
-    // bbox-prune pass, which keeps exact-top-K (every unprobed cluster that
-    // could contain a contender still gets a bbox check).
-    //
-    // `in_probe` marks the PROBE survivors so the prune pass skips them.
-    var probe_dists: [PROBE_CLUSTERS]f32 = undefined;
-    var probe_idxs: [PROBE_CLUSTERS]u32 = undefined;
-    inline for (0..PROBE_CLUSTERS) |i| {
-        probe_dists[i] = centroid_dists[i];
-        probe_idxs[i] = @intCast(i);
-    }
-    heapify_max(&probe_dists, &probe_idxs);
-    var c2: usize = PROBE_CLUSTERS;
-    while (c2 < qds.k_clusters) : (c2 += 1) {
-        if (centroid_dists[c2] < probe_dists[0]) {
-            probe_dists[0] = centroid_dists[c2];
-            probe_idxs[0] = @intCast(c2);
-            sift_down_max(&probe_dists, &probe_idxs, 0);
+    // sorted insertion-sort accumulator. PROBE is small (8) — at K=1024,
+    // O(K·P) shifts are indistinguishable from O(K log P) heap ops, and the
+    // result is already ascending so the first cluster scanned is the
+    // closest (tightens `top_dists[0]` fastest). Mirrors thiagorigonatti #1
+    // `insert_probe_cluster` (rinha-2026/src/ivf_search.c:67).
+    var probe_dists: [PROBE_CLUSTERS]f32 = @splat(std.math.inf(f32));
+    var probe_idxs: [PROBE_CLUSTERS]u32 = @splat(0);
+    for (0..qds.k_clusters) |c| {
+        const d = centroid_dists[c];
+        if (d >= probe_dists[PROBE_CLUSTERS - 1]) continue;
+        var pos: usize = PROBE_CLUSTERS - 1;
+        while (pos > 0 and d < probe_dists[pos - 1]) : (pos -= 1) {}
+        var i: usize = PROBE_CLUSTERS - 1;
+        while (i > pos) : (i -= 1) {
+            probe_dists[i] = probe_dists[i - 1];
+            probe_idxs[i] = probe_idxs[i - 1];
         }
+        probe_dists[pos] = d;
+        probe_idxs[pos] = @intCast(c);
     }
-    // PROBE is small (8) — insertion-sort the survivors ascending so the
-    // first cluster scanned is the closest (tightens `top_dists[0]` fastest).
-    sort_pairs_asc(&probe_dists, &probe_idxs);
-
-    var in_probe = [_]bool{false} ** MAX_K_CLUSTERS;
-    inline for (0..PROBE_CLUSTERS) |i| in_probe[probe_idxs[i]] = true;
 
     // Step 3: scan PROBE clusters in nearest-first order, then bbox-prune
     // the remaining K - PROBE in arbitrary order. Most fail-prune cheaply.
+    // We mark probed clusters by overwriting their centroid_dists with +inf
+    // so the bbox-prune pass below skips them via a single `< inf` compare —
+    // no separate `in_probe` bitset (saves 1 KiB stack + a write per probe).
     var q_int: [N_FEATURES]i16 = undefined;
     quantize_query(q, &q_int);
 
     var top_dists: [TOP_K]i64 = @splat(std.math.maxInt(i64));
     var top_rows: [TOP_K]u32 = @splat(0);
 
+    centroid_dists[probe_idxs[0]] = std.math.inf(f32);
     scan_cluster_blocks(qds, probe_idxs[0], &q_int, &top_dists, &top_rows);
     inline for (1..PROBE_CLUSTERS) |i| {
         const c = probe_idxs[i];
+        centroid_dists[c] = std.math.inf(f32);
         const lb = bbox_lower_bound_sq(&q_int, qds.bbox_lo, qds.bbox_hi, c);
         if (lb < top_dists[0]) {
             scan_cluster_blocks(qds, c, &q_int, &top_dists, &top_rows);
         }
     }
     for (0..qds.k_clusters) |c| {
-        if (in_probe[c]) continue;
+        if (centroid_dists[c] == std.math.inf(f32)) continue;
         const lb = bbox_lower_bound_sq(&q_int, qds.bbox_lo, qds.bbox_hi, c);
         if (lb >= top_dists[0]) continue;
         scan_cluster_blocks(qds, c, &q_int, &top_dists, &top_rows);
@@ -269,30 +199,6 @@ inline fn bbox_lower_bound_sq(
     return @reduce(.Add, sq);
 }
 
-/// Test-only: scan every cluster (PROBE = K). Used by `dataset_blob.zig`
-/// equivalence tests against `euclidean_topk_q` with K small enough that PROBE
-/// would be ≥ K. Iterates `qds.cluster_starts` directly so it's correct for
-/// any `k_clusters`.
-pub fn euclidean_topk_q_ivf_full(
-    qds: transform_reference.IvfQuantizedDataset,
-    q: *const [N_FEATURES]f32,
-    out: *[TOP_K]u32,
-) void {
-    std.debug.assert(qds.n >= TOP_K);
-
-    var q_int: [N_FEATURES]i16 = undefined;
-    quantize_query(q, &q_int);
-
-    var top_dists: [TOP_K]i64 = @splat(std.math.maxInt(i64));
-    var top_rows: [TOP_K]u32 = @splat(0);
-
-    for (0..qds.k_clusters) |c| {
-        scan_cluster_blocks(qds, c, &q_int, &top_dists, &top_rows);
-    }
-
-    inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
-}
-
 // ─── block-SoA cluster scan (production IVF inner loop) ──────────────────
 
 /// Scan all blocks of cluster `c`, sifting any row whose squared distance
@@ -322,13 +228,31 @@ inline fn scan_cluster_blocks(
             @prefetch(&qds.block_features[(b + 1) * stride], .{ .locality = 1 });
         }
 
-        // Inner loop matches Phase 9.6 W=16 SoA pattern: i16 sub (safe
+        // Inner loop matches the Phase 9.6 W=16 SoA pattern: i16 sub (safe
         // because pad is 0 ∈ valid range, real features ∈ [-FIX_SCALE,
         // FIX_SCALE], diff ⊂ ±2*FIX_SCALE = ±20000 fits in i16), then
         // widen to i32 for the square (4e8 max per feature fits in i32),
         // then widen to i64 for the running 14-feature sum (5.6e9 fits).
+        //
+        // Mid-loop prune: after the first `EARLY_OUT_AT` features, every
+        // lane's running partial-sum is a true LOWER BOUND on its final
+        // distance (each remaining feature can only ADD non-negative).
+        // If the smallest lane's partial-sum already exceeds the current
+        // K-th best, no lane in this block can win — skip the remaining
+        // features and the sift. The Min reduction is 1 horizontal op
+        // every block; the saved work is 7 × (load+sub+widen+mul+widen+add)
+        // ≈ 42 vector ops on every pruned block.
+        const EARLY_OUT_AT: usize = N_FEATURES / 2;
         var dist: BVi64 = @splat(0);
-        inline for (0..N_FEATURES) |k| {
+        inline for (0..EARLY_OUT_AT) |k| {
+            const r_i16: BVi16 = qds.block_features[block_base + k * BLOCK_W ..][0..BLOCK_W].*;
+            const diff_i16: BVi16 = q_vec[k] - r_i16;
+            const diff_i32: BVi32 = diff_i16;
+            const sq: BVi32 = diff_i32 * diff_i32;
+            dist += @as(BVi64, sq);
+        }
+        if (@reduce(.Min, dist) > top_dists[0]) continue;
+        inline for (EARLY_OUT_AT..N_FEATURES) |k| {
             const r_i16: BVi16 = qds.block_features[block_base + k * BLOCK_W ..][0..BLOCK_W].*;
             const diff_i16: BVi16 = q_vec[k] - r_i16;
             const diff_i32: BVi32 = diff_i16;
@@ -348,15 +272,144 @@ inline fn scan_cluster_blocks(
         inline for (0..BLOCK_W) |lane| {
             if (@as(u32, @intCast(lane)) < valid_lanes) {
                 const d = dist[lane];
-                if (d < top_dists[0]) {
-                    sift_in_min_i64(top_dists, top_rows, d, lane_row_base + @as(u32, @intCast(lane)));
+                const r = lane_row_base + @as(u32, @intCast(lane));
+                if (better_pair_i64(d, r, top_dists[0], top_rows[0])) {
+                    sift_in_min_i64(top_dists, top_rows, d, r);
                 }
             }
         }
     }
 }
 
-// ─── int inner loop (brute-force flat-SoA path; test-only) ───────────────
+// ─── sift helpers (production) ───────────────────────────────────────────
+//
+// Top-K kept descending by (dist, then row): index 0 = worst (largest dist
+// or, on tie, largest row). New entry replaces position 0 then bubbles up
+// (toward TOP_K-1) while it remains *better* than its right neighbour.
+
+/// Strict lexicographic ordering on (dist, row) — smaller dist wins; ties
+/// broken by smaller row index. Used by `sift_in_min_i64` so the top-K is
+/// deterministic regardless of cluster scan order. Mirrors the
+/// `is_better_pair` comparator in thiagorigonatti #1
+/// (rinha-2026/src/ivf_search.c:18).
+inline fn better_pair_i64(da: i64, ia: u32, db: i64, ib: u32) bool {
+    return da < db or (da == db and ia < ib);
+}
+
+inline fn sift_in_min_i64(
+    dists: *[TOP_K]i64,
+    rows: *[TOP_K]u32,
+    new_dist: i64,
+    new_row: u32,
+) void {
+    dists[0] = new_dist;
+    rows[0] = new_row;
+    inline for (0..TOP_K - 1) |i| {
+        if (!better_pair_i64(dists[i], rows[i], dists[i + 1], rows[i + 1])) break;
+        const td = dists[i];
+        dists[i] = dists[i + 1];
+        dists[i + 1] = td;
+        const tr = rows[i];
+        rows[i] = rows[i + 1];
+        rows[i + 1] = tr;
+    }
+}
+
+// ─── reference / bench-only paths ────────────────────────────────────────
+//
+// Below this banner: nothing the production handler touches. Kept around so
+// `bench.zig` can A/B against the IVF path and `dataset_blob.zig` tests can
+// differentially compare. None of these pull labels via the bitset directly
+// — they all return row indices that the caller maps separately.
+
+/// Brute-force f32 top-K against a non-quantized dataset. Bench-only.
+pub fn euclidean_topk(
+    ds: transform_reference.Dataset,
+    q: *const [N_FEATURES]f32,
+    out: *[TOP_K]u32,
+) void {
+    std.debug.assert(ds.n >= TOP_K);
+
+    var q_vec: [N_FEATURES]Vec = undefined;
+    inline for (0..N_FEATURES) |k| q_vec[k] = @splat(q[k]);
+
+    var top_dists: [TOP_K]f32 = @splat(std.math.inf(f32));
+    var top_rows: [TOP_K]u32 = @splat(0);
+
+    const n = ds.n;
+    const features = ds.features;
+
+    var row: usize = 0;
+    while (row + W <= n) : (row += W) {
+        var dist: Vec = @splat(0);
+        inline for (0..N_FEATURES) |k| {
+            const r_chunk: Vec = features[k * n + row ..][0..W].*;
+            const diff = q_vec[k] - r_chunk;
+            dist += diff * diff;
+        }
+        inline for (0..W) |lane| {
+            const d = dist[lane];
+            if (d < top_dists[0]) {
+                sift_in_min_f32(&top_dists, &top_rows, d, @intCast(row + lane));
+            }
+        }
+    }
+    while (row < n) : (row += 1) {
+        var dist: f32 = 0;
+        inline for (0..N_FEATURES) |k| {
+            const v = features[k * n + row];
+            const diff = q[k] - v;
+            dist += diff * diff;
+        }
+        if (dist < top_dists[0]) {
+            sift_in_min_f32(&top_dists, &top_rows, dist, @intCast(row));
+        }
+    }
+
+    inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
+}
+
+/// Brute-force int top-K over an i16-quantized flat-SoA dataset. Bench/test only.
+pub fn euclidean_topk_q(
+    qds: transform_reference.QuantizedDataset,
+    q: *const [N_FEATURES]f32,
+    out: *[TOP_K]u32,
+) void {
+    std.debug.assert(qds.n >= TOP_K);
+
+    var q_int: [N_FEATURES]i16 = undefined;
+    quantize_query(q, &q_int);
+
+    var top_dists: [TOP_K]i64 = @splat(std.math.maxInt(i64));
+    var top_rows: [TOP_K]u32 = @splat(0);
+
+    scan_range_int(qds.features, qds.n, 0, @intCast(qds.n), &q_int, &top_dists, &top_rows);
+
+    inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
+}
+
+/// Test-only: scan every cluster of an IVF dataset (PROBE = K). Used by
+/// `dataset_blob.zig` equivalence tests against `euclidean_topk_q` with K
+/// small enough that PROBE would be ≥ K.
+pub fn euclidean_topk_q_ivf_full(
+    qds: transform_reference.IvfQuantizedDataset,
+    q: *const [N_FEATURES]f32,
+    out: *[TOP_K]u32,
+) void {
+    std.debug.assert(qds.n >= TOP_K);
+
+    var q_int: [N_FEATURES]i16 = undefined;
+    quantize_query(q, &q_int);
+
+    var top_dists: [TOP_K]i64 = @splat(std.math.maxInt(i64));
+    var top_rows: [TOP_K]u32 = @splat(0);
+
+    for (0..qds.k_clusters) |c| {
+        scan_cluster_blocks(qds, c, &q_int, &top_dists, &top_rows);
+    }
+
+    inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
+}
 
 inline fn scan_range_int(
     features: []const i16,
@@ -371,9 +424,6 @@ inline fn scan_range_int(
     inline for (0..N_FEATURES) |k| q_vec[k] = @splat(q_int[k]);
 
     var row: usize = start;
-    // Prefetch ~256 B ahead in feature[0]'s column. The HW L1 streamer picks
-    // up the other 13 column streams once any byte in each is touched; issuing
-    // 14 prefetches per chunk would saturate the prefetch queue and backfire.
     const PF_AHEAD: usize = W * 8;
     while (row + W <= end) : (row += W) {
         if (row + PF_AHEAD < end) {
@@ -382,21 +432,19 @@ inline fn scan_range_int(
         var dist: Vi64 = @splat(0);
         inline for (0..N_FEATURES) |k| {
             const r_i16: Vi16 = features[k * n + row ..][0..W].*;
-            const diff_i16: Vi16 = q_vec[k] - r_i16; // safe at FIX_SCALE=10000
+            const diff_i16: Vi16 = q_vec[k] - r_i16;
             const diff_i32: Vi32 = diff_i16;
             const sq: Vi32 = diff_i32 * diff_i32;
             dist += @as(Vi64, sq);
         }
         inline for (0..W) |lane| {
             const d = dist[lane];
-            if (d < top_dists[0]) {
-                sift_in_min_i64(top_dists, top_rows, d, @intCast(row + lane));
+            const r: u32 = @intCast(row + lane);
+            if (better_pair_i64(d, r, top_dists[0], top_rows[0])) {
+                sift_in_min_i64(top_dists, top_rows, d, r);
             }
         }
     }
-    // W/2 fallback chunk for residues in [W/2, W) — keeps clusters of 8–15
-    // rows (and average ~5-row residues after a W=16 main loop) in SIMD
-    // instead of falling all the way to the scalar tail.
     if (row + HW <= end) {
         var dist: HVi64 = @splat(0);
         inline for (0..N_FEATURES) |k| {
@@ -409,8 +457,9 @@ inline fn scan_range_int(
         }
         inline for (0..HW) |lane| {
             const d = dist[lane];
-            if (d < top_dists[0]) {
-                sift_in_min_i64(top_dists, top_rows, d, @intCast(row + lane));
+            const r: u32 = @intCast(row + lane);
+            if (better_pair_i64(d, r, top_dists[0], top_rows[0])) {
+                sift_in_min_i64(top_dists, top_rows, d, r);
             }
         }
         row += HW;
@@ -421,17 +470,12 @@ inline fn scan_range_int(
             const diff: i32 = @as(i32, q_int[k]) - @as(i32, features[k * n + row]);
             dist += @as(i64, diff * diff);
         }
-        if (dist < top_dists[0]) {
-            sift_in_min_i64(top_dists, top_rows, dist, @intCast(row));
+        const r: u32 = @intCast(row);
+        if (better_pair_i64(dist, r, top_dists[0], top_rows[0])) {
+            sift_in_min_i64(top_dists, top_rows, dist, r);
         }
     }
 }
-
-// ─── sift helpers ─────────────────────────────────────────────────────────
-//
-// Top-K kept descending — `dists[0]` is the LARGEST of the current best, so
-// any new entry strictly smaller than it displaces it. After replace we
-// bubble down (largest stays at index 0) until the new entry finds its slot.
 
 inline fn sift_in_min_f32(
     dists: *[TOP_K]f32,
@@ -449,80 +493,6 @@ inline fn sift_in_min_f32(
         const tr = rows[i];
         rows[i] = rows[i + 1];
         rows[i + 1] = tr;
-    }
-}
-
-inline fn sift_in_min_i64(
-    dists: *[TOP_K]i64,
-    rows: *[TOP_K]u32,
-    new_dist: i64,
-    new_row: u32,
-) void {
-    dists[0] = new_dist;
-    rows[0] = new_row;
-    inline for (0..TOP_K - 1) |i| {
-        if (dists[i + 1] <= dists[i]) break;
-        const td = dists[i];
-        dists[i] = dists[i + 1];
-        dists[i + 1] = td;
-        const tr = rows[i];
-        rows[i] = rows[i + 1];
-        rows[i + 1] = tr;
-    }
-}
-
-// ─── PROBE-cluster heap helpers ───────────────────────────────────────────
-//
-// Operate on parallel `dists` (key) + `idxs` (payload) arrays of compile-
-// time size `PROBE_CLUSTERS`. Max-heap means root = largest, so a smaller
-// candidate displaces it. After all sifting, `sort_pairs_asc` flips it
-// to ascending for the nearest-first scan order.
-
-inline fn heap_swap(dists: *[PROBE_CLUSTERS]f32, idxs: *[PROBE_CLUSTERS]u32, a: usize, b: usize) void {
-    const td = dists[a];
-    dists[a] = dists[b];
-    dists[b] = td;
-    const ti = idxs[a];
-    idxs[a] = idxs[b];
-    idxs[b] = ti;
-}
-
-inline fn sift_down_max(dists: *[PROBE_CLUSTERS]f32, idxs: *[PROBE_CLUSTERS]u32, start: usize) void {
-    var root = start;
-    while (true) {
-        const left = 2 * root + 1;
-        if (left >= PROBE_CLUSTERS) break;
-        var swap = root;
-        if (dists[swap] < dists[left]) swap = left;
-        const right = left + 1;
-        if (right < PROBE_CLUSTERS and dists[swap] < dists[right]) swap = right;
-        if (swap == root) break;
-        heap_swap(dists, idxs, root, swap);
-        root = swap;
-    }
-}
-
-inline fn heapify_max(dists: *[PROBE_CLUSTERS]f32, idxs: *[PROBE_CLUSTERS]u32) void {
-    // Floyd's bottom-up: start at last internal node, sift down. For
-    // PROBE_CLUSTERS=8 this unrolls to ~3 sifts.
-    var i: isize = @as(isize, PROBE_CLUSTERS / 2) - 1;
-    while (i >= 0) : (i -= 1) sift_down_max(dists, idxs, @intCast(i));
-}
-
-inline fn sort_pairs_asc(dists: *[PROBE_CLUSTERS]f32, idxs: *[PROBE_CLUSTERS]u32) void {
-    // Insertion sort, ascending by dist. PROBE_CLUSTERS is small (8) so
-    // this beats pdq's overhead and the branch pattern is predictable.
-    var i: usize = 1;
-    while (i < PROBE_CLUSTERS) : (i += 1) {
-        const kd = dists[i];
-        const ki = idxs[i];
-        var j: usize = i;
-        while (j > 0 and dists[j - 1] > kd) : (j -= 1) {
-            dists[j] = dists[j - 1];
-            idxs[j] = idxs[j - 1];
-        }
-        dists[j] = kd;
-        idxs[j] = ki;
     }
 }
 
@@ -794,34 +764,29 @@ test "euclidean_topk_q_ivf hand-built tiny clustered dataset" {
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4 }, &out);
 }
 
-test "heap-select helpers: smallest PROBE_CLUSTERS over a 32-element stream" {
-    // Feed 32 known distances; verify the heap-select picks the 8 smallest.
+test "probe-select: smallest PROBE_CLUSTERS over a 32-element stream" {
+    // Feed 32 shuffled distances through the same insertion-sort accumulator
+    // used in `euclidean_topk_q_ivf`; verify it picks the 8 smallest in order.
     var src: [32]f32 = undefined;
     for (0..32) |i| src[i] = @floatFromInt((i * 37 + 13) % 32); // shuffled 0..31
 
-    var dists: [PROBE_CLUSTERS]f32 = undefined;
-    var idxs: [PROBE_CLUSTERS]u32 = undefined;
-    inline for (0..PROBE_CLUSTERS) |i| {
-        dists[i] = src[i];
-        idxs[i] = @intCast(i);
-    }
-    heapify_max(&dists, &idxs);
-    var c: usize = PROBE_CLUSTERS;
-    while (c < src.len) : (c += 1) {
-        if (src[c] < dists[0]) {
-            dists[0] = src[c];
-            idxs[0] = @intCast(c);
-            sift_down_max(&dists, &idxs, 0);
+    var dists: [PROBE_CLUSTERS]f32 = @splat(std.math.inf(f32));
+    var idxs: [PROBE_CLUSTERS]u32 = @splat(0);
+    for (src, 0..) |d, c| {
+        if (d >= dists[PROBE_CLUSTERS - 1]) continue;
+        var pos: usize = PROBE_CLUSTERS - 1;
+        while (pos > 0 and d < dists[pos - 1]) : (pos -= 1) {}
+        var i: usize = PROBE_CLUSTERS - 1;
+        while (i > pos) : (i -= 1) {
+            dists[i] = dists[i - 1];
+            idxs[i] = idxs[i - 1];
         }
+        dists[pos] = d;
+        idxs[pos] = @intCast(c);
     }
-    sort_pairs_asc(&dists, &idxs);
 
-    // Expected smallest 8 of 0..31 are {0,1,2,3,4,5,6,7} in ascending order.
     inline for (0..PROBE_CLUSTERS) |i| {
         try std.testing.expectEqual(@as(f32, @floatFromInt(i)), dists[i]);
-    }
-    // Each survivor's idx must point back to a src entry whose value matches.
-    inline for (0..PROBE_CLUSTERS) |i| {
         try std.testing.expectEqual(dists[i], src[idxs[i]]);
     }
 }

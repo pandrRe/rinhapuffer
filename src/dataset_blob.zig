@@ -306,69 +306,6 @@ fn load_inner(mapped: fast_json.Mapped, hdr: *const Header) LoadError!IvfQuantiz
     };
 }
 
-/// f32 dataset materialised by dequantizing a v7 blob. Owns the f32 feature
-/// and label buffers; the source mmap is closed before this returns. Provided
-/// for benchmarking parity against `euclidean_topk` — production never pays the
-/// 168 MB allocation. The cluster reordering is preserved (rows are still
-/// grouped by cluster) which doesn't change search semantics.
-pub const UnquantBlob = struct {
-    allocator: std.mem.Allocator,
-    features: []f32,
-    labels: []bool,
-    dataset: transform_reference.Dataset,
-
-    pub fn deinit(self: *UnquantBlob) void {
-        self.allocator.free(self.features);
-        self.allocator.free(self.labels);
-    }
-};
-
-/// Load the v8 blob and dequantize every feature into a fresh **flat-SoA**
-/// f32 buffer (column-major, `features[k * n + row]`), undoing the block-SoA
-/// layout. Also unpacks the bitset labels into a fresh `[]bool`. Resulting
-/// `Dataset` is consumable by `search.euclidean_topk` and friends.
-/// Bench-only path; production never pays the 168 MB allocation.
-pub fn load_unquant(allocator: std.mem.Allocator, path: []const u8) !UnquantBlob {
-    var blob = try load(path);
-    defer blob.deinit();
-    const qds = blob.dataset;
-
-    const features = try allocator.alloc(f32, N_FEATURES * qds.n);
-    errdefer allocator.free(features);
-    const labels = try allocator.alloc(bool, qds.n);
-    errdefer allocator.free(labels);
-
-    const inv_scale: f32 = 1.0 / @as(f32, @floatFromInt(search.FIX_SCALE));
-    // Walk every block, dequantize each lane into the flat-SoA buffer at
-    // its canonical row position. Padding lanes are silently dropped (they
-    // sit beyond cluster_starts[c+1]).
-    for (0..qds.k_clusters) |c| {
-        const cs = qds.cluster_starts[c];
-        const ce = qds.cluster_starts[c + 1];
-        const block_start = qds.cluster_block_starts[c];
-        const blocks_in_c = qds.cluster_block_starts[c + 1] - block_start;
-        for (0..blocks_in_c) |b| {
-            const block_base = (@as(usize, block_start) + b) * N_FEATURES * BLOCK_W;
-            for (0..BLOCK_W) |lane| {
-                const row = cs + @as(u32, @intCast(b * BLOCK_W + lane));
-                if (row >= ce) break;
-                for (0..N_FEATURES) |k| {
-                    const v = qds.block_features[block_base + k * BLOCK_W + lane];
-                    features[k * qds.n + row] = @as(f32, @floatFromInt(v)) * inv_scale;
-                }
-            }
-        }
-    }
-    for (0..qds.n) |i| labels[i] = label_at(qds.labels_bits, @intCast(i)) == 1;
-
-    return .{
-        .allocator = allocator,
-        .features = features,
-        .labels = labels,
-        .dataset = .{ .n = qds.n, .features = features, .labels = labels },
-    };
-}
-
 /// Serialize a Dataset to `<dir>/<sub_path>`, truncating an existing file.
 /// Runs the full IVF prep pipeline:
 ///   1. draw a random sample, run plain Euclidean k-means → centroids
@@ -603,6 +540,68 @@ pub fn write(
             w = end_w;
         }
     }
+}
+
+// ─── reference / bench-only paths ────────────────────────────────────────
+//
+// `UnquantBlob` + `load_unquant` materialise the dataset as flat f32 SoA so
+// `bench.zig` can A/B against the IVF path. Production never pays the
+// 168 MB allocation.
+
+/// f32 dataset materialised by dequantizing a v8 blob. Owns the f32 feature
+/// and label buffers; the source mmap is closed before this returns.
+pub const UnquantBlob = struct {
+    allocator: std.mem.Allocator,
+    features: []f32,
+    labels: []bool,
+    dataset: transform_reference.Dataset,
+
+    pub fn deinit(self: *UnquantBlob) void {
+        self.allocator.free(self.features);
+        self.allocator.free(self.labels);
+    }
+};
+
+/// Load the v8 blob and dequantize every feature into a fresh flat-SoA f32
+/// buffer (column-major, `features[k * n + row]`), undoing the block-SoA
+/// layout. Also unpacks the bitset labels into a fresh `[]bool`. Result is
+/// consumable by `search.euclidean_topk` and friends. Bench-only.
+pub fn load_unquant(allocator: std.mem.Allocator, path: []const u8) !UnquantBlob {
+    var blob = try load(path);
+    defer blob.deinit();
+    const qds = blob.dataset;
+
+    const features = try allocator.alloc(f32, N_FEATURES * qds.n);
+    errdefer allocator.free(features);
+    const labels = try allocator.alloc(bool, qds.n);
+    errdefer allocator.free(labels);
+
+    const inv_scale: f32 = 1.0 / @as(f32, @floatFromInt(search.FIX_SCALE));
+    for (0..qds.k_clusters) |c| {
+        const cs = qds.cluster_starts[c];
+        const ce = qds.cluster_starts[c + 1];
+        const block_start = qds.cluster_block_starts[c];
+        const blocks_in_c = qds.cluster_block_starts[c + 1] - block_start;
+        for (0..blocks_in_c) |b| {
+            const block_base = (@as(usize, block_start) + b) * N_FEATURES * BLOCK_W;
+            for (0..BLOCK_W) |lane| {
+                const row = cs + @as(u32, @intCast(b * BLOCK_W + lane));
+                if (row >= ce) break;
+                for (0..N_FEATURES) |k| {
+                    const v = qds.block_features[block_base + k * BLOCK_W + lane];
+                    features[k * qds.n + row] = @as(f32, @floatFromInt(v)) * inv_scale;
+                }
+            }
+        }
+    }
+    for (0..qds.n) |i| labels[i] = label_at(qds.labels_bits, @intCast(i)) == 1;
+
+    return .{
+        .allocator = allocator,
+        .features = features,
+        .labels = labels,
+        .dataset = .{ .n = qds.n, .features = features, .labels = labels },
+    };
 }
 
 // ─── tests ──────────────────────────────────────────────────────────────────
