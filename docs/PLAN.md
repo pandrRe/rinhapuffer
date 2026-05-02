@@ -118,8 +118,8 @@ Goal: accept HTTP/1.1 on a TCP socket, route `/ready` and `/fraud-score`, no log
 
 Goal: end-to-end. Real fraud scoring through the HTTP path.
 
-- [ ] **7.1** On boot: `dataset_blob.load("resources/dataset.bin")`, flip the `ready` flag.
-- [ ] **7.2** `/fraud-score` handler:
+- [x] **7.1** On boot: `dataset_blob.load("resources/dataset.bin")`, flip the `ready` flag.
+- [x] **7.2** `/fraud-score` handler:
   1. Parse body length, validate it fits in the buffer.
   2. `payload.vectorize(body, &q)` — already zero-alloc.
   3. L2-normalize `q` in place.
@@ -127,9 +127,9 @@ Goal: end-to-end. Real fraud scoring through the HTTP path.
   5. `fraud_count = popcount(labels[top5])`.
   6. `score = fraud_count / 5.0`; `approved = score < 0.6`.
   7. Write a precomputed JSON template (six possible scores: 0.0, 0.2, 0.4, 0.6, 0.8, 1.0).
-- [ ] **7.3** Integration test against the example payloads + spec golden.
-- [ ] **7.4** End-to-end bench: payloads/sec at 0.25 CPU under `taskset -c 0` + `cgroups` CPU cap.
-- [ ] **7.5** Commit.
+- [x] **7.3** Integration test against the example payloads + spec golden.
+- [x] **7.4** End-to-end bench: payloads/sec at 0.25 CPU under `taskset -c 0` + `cgroups` CPU cap.
+- [x] **7.5** Commit.
 
 **Exit criterion**: server returns spec-compliant `fraud-score` on the example payloads; sustained throughput measured.
 
