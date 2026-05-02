@@ -21,40 +21,34 @@ pub const Dataset = struct {
     labels: []const bool,
 };
 
-/// Quantized SoA view over a u16-encoded dataset (the on-disk v2 format).
+/// Quantized SoA view over an i16-encoded dataset.
 ///
-/// Each feature column is stored as `n` u16 values. The original f32 value is
-/// reconstructed via `f = u16 * inv_scales[k] + mins[k]`, with `mins` and
-/// `inv_scales` cached at load time from the per-feature `(min, scale)` pairs
-/// in the blob header.
-///
-/// `euclidean_topk_q` consumes this view directly without materialising f32
-/// columns; only `@floatFromInt(u16) → f32` happens per row in the inner loop.
+/// Each feature column is stored as `n` i16 values, encoded with a single
+/// global scale `search.FIX_SCALE`: `int_value = round(float_value * FIX_SCALE)`.
+/// The hot path NEVER dequantizes — search ranks by `Σ (q_int − r_int)²` in
+/// integer space, which is `FIX_SCALE²` times the true float distance and
+/// therefore order-preserving.
 pub const QuantizedDataset = struct {
     n: usize,
-    features: []const u16,
+    features: []const i16,
     labels: []const bool,
-    mins: [N_FEATURES]f32,
-    inv_scales: [N_FEATURES]f32,
 };
 
 /// IVF-augmented quantized SoA view: rows are reordered cluster-by-cluster
 /// (so cluster `c` occupies `[cluster_starts[c], cluster_starts[c+1])` in
-/// every feature column), with `centroids` row-major over `[k_clusters][14]f32`.
+/// every feature column), with `centroids` row-major over `[k_clusters][14]f32`
+/// (centroids stay in float for cheap PROBE selection — only ~1024 of them).
 ///
 /// Search picks the top-N centroids by min Euclidean distance to the query
-/// (== max `dot(q, c) − ½‖c‖²`) then scans only those clusters' row slices
-/// with the same Euclidean ranking. The u16 features and per-feature
-/// `(min, inv_scale)` are identical in shape and meaning to `QuantizedDataset`.
+/// (in float), then scans only those clusters' row slices with the int
+/// Euclidean inner loop.
 pub const IvfQuantizedDataset = struct {
     n: usize,
     k_clusters: usize,
-    features: []const u16,
+    features: []const i16,
     labels: []const bool,
     centroids: []const f32,
     cluster_starts: []const u32,
-    mins: [N_FEATURES]f32,
-    inv_scales: [N_FEATURES]f32,
 };
 
 pub const Error = fast_json.ParseError || error{BufferTooSmall};

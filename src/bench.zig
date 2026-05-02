@@ -456,20 +456,18 @@ fn build_search_queries_f32(
 }
 
 /// Build `SEARCH_QUERIES` queries by sampling rows from the quantized dataset
-/// (dequantizing on the fly) and perturbing them slightly so euclidean_topk_q
-/// can't shortcut to score=1. Works against either `QuantizedDataset` or
-/// `IvfQuantizedDataset` (both have the same `features`/`mins`/`inv_scales`
-/// shape for raw row reads).
+/// (dequantizing on the fly via FIX_SCALE) and perturbing them slightly so
+/// euclidean_topk_q can't shortcut to dist=0.
 fn build_search_queries_q(
     qds: transform_reference.IvfQuantizedDataset,
     queries: *[SEARCH_QUERIES][search.N_FEATURES]f32,
 ) void {
+    const inv_scale: f32 = 1.0 / @as(f32, @floatFromInt(search.FIX_SCALE));
     const stride = if (qds.n > SEARCH_QUERIES) qds.n / SEARCH_QUERIES else 1;
     for (0..SEARCH_QUERIES) |i| {
         const row = (i * stride) % qds.n;
         for (0..search.N_FEATURES) |c| {
-            const q_u16 = qds.features[c * qds.n + row];
-            const v: f32 = @as(f32, @floatFromInt(q_u16)) * qds.inv_scales[c] + qds.mins[c];
+            const v: f32 = @as(f32, @floatFromInt(qds.features[c * qds.n + row])) * inv_scale;
             // Tiny per-feature perturbation to defeat any "exact match" fast path.
             const jitter: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(c)) - 7)) * 0.001;
             queries[i][c] = v + jitter;
@@ -478,15 +476,13 @@ fn build_search_queries_q(
 }
 
 /// Construct a brute-force `QuantizedDataset` view aliasing the same
-/// buffers as the IVF dataset. Used to bench the brute-force path on the
-/// v3 blob and to compute recall@5 ground-truth.
+/// buffers as the IVF dataset. Used to bench the brute-force path and to
+/// compute recall@5 ground-truth.
 fn brute_view(qds: transform_reference.IvfQuantizedDataset) transform_reference.QuantizedDataset {
     return .{
         .n = qds.n,
         .features = qds.features,
         .labels = qds.labels,
-        .mins = qds.mins,
-        .inv_scales = qds.inv_scales,
     };
 }
 
@@ -880,7 +876,7 @@ pub fn main(init: std.process.Init) !void {
     const load_stats = try bench_dataset_load();
     print_load_stats("dataset_blob.load", load_stats);
 
-    std.debug.print("\n=== cosine top-K (quantized u16, IVF probe={d}/{d}) ===\n\n", .{
+    std.debug.print("\n=== euclidean top-K (quantized i16, IVF probe={d}/{d}) ===\n\n", .{
         dataset_blob.PROBE_CLUSTERS,
         dataset_blob.K_CLUSTERS,
     });
@@ -890,7 +886,7 @@ pub fn main(init: std.process.Init) !void {
     print_search_stats("search.euclidean_topk_q_ivf", search_stats_ivf);
     std.debug.print("    mean recall@5:    {d:.3} (vs euclidean_topk_q brute force)\n", .{recall});
 
-    std.debug.print("\n=== cosine top-K (quantized u16, brute force) ===\n\n", .{});
+    std.debug.print("\n=== euclidean top-K (quantized i16, brute force) ===\n\n", .{});
 
     const search_stats_q = try bench_euclidean_topk_q_brute(allocator);
     print_search_stats("search.euclidean_topk_q", search_stats_q);
