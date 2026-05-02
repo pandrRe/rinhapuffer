@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
@@ -11,7 +12,15 @@ pub fn build(b: *std.Build) void {
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
     // for restricting supported target set are available.
-    const target = b.standardTargetOptions(.{});
+    //
+    // Default to musl on Linux: GCC 16+ ships crt1.o with .sframe sections
+    // that use R_X86_64_PC64 relocations, which Zig's self-hosted linker does
+    // not support. Musl avoids that entirely and is what Docker uses anyway.
+    const default_target: std.Target.Query = if (builtin.os.tag == .linux)
+        .{ .abi = .musl }
+    else
+        .{};
+    const target = b.standardTargetOptions(.{ .default_target = default_target });
     // Standard optimization options allow the person running `zig build` to select
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
