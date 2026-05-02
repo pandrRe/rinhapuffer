@@ -36,7 +36,6 @@ const Vi64 = @Vector(W, i64);
 
 /// Stack-buffer cap. 4 KB at K=1024.
 const MAX_K_CLUSTERS: usize = 1024;
-const PROBE_CLUSTERS: usize = 8;
 
 /// Quantize a 14-feature float query to i16 once per request.
 inline fn quantize_query(q: *const [N_FEATURES]f32, out: *[N_FEATURES]i16) void {
@@ -120,17 +119,18 @@ pub fn euclidean_topk_q(
     inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
 }
 
-/// Production IVF Euclidean top-K — **exact**, regardless of PROBE.
+/// Production IVF Euclidean top-K — **exact** by bbox-repair construction.
 ///
-/// Float Euclidean against the centroids picks `PROBE_CLUSTERS` for the
-/// initial int scan (tight upper bound on the K-th best distance). Then a
-/// **bbox repair pass** walks every other cluster: for each, compute the
-/// axis-aligned lower bound `LB² = Σ_k max(0, max(q − hi, lo − q))²` from
-/// the cluster's per-feature `[lo, hi]`. If `LB² ≥ top_dists[0]`, no point
-/// in the cluster can improve us — skip. Otherwise scan it. By construction
-/// every cluster containing a true top-K neighbour passes the prune (its
-/// neighbour's true distance ≤ current K-th best ≤ LB), so the result is
-/// exact.
+/// One ordered walk: SIMD-compute every centroid distance, sort cluster
+/// indices ascending by centroid distance, then traverse in order. Scan the
+/// nearest cluster unconditionally to seed `top_dists`; for each subsequent
+/// cluster compute the axis-aligned lower bound
+/// `LB² = Σ_k max(0, max(q − hi, lo − q))²` against the cluster's per-feature
+/// `[lo, hi]` and skip if `LB² ≥ top_dists[0]`. Every cluster containing a
+/// true top-K neighbour passes the prune (neighbour's true distance ≤ current
+/// K-th best ≤ LB), so the top-K set is exact regardless of how many clusters
+/// actually get scanned. The centroid-ascending order tightens `top_dists`
+/// fast — most far clusters then prune cheaply on the bbox check.
 pub fn euclidean_topk_q_ivf(
     qds: transform_reference.IvfQuantizedDataset,
     q: *const [N_FEATURES]f32,
@@ -138,48 +138,42 @@ pub fn euclidean_topk_q_ivf(
 ) void {
     std.debug.assert(qds.n >= TOP_K);
     std.debug.assert(qds.k_clusters <= MAX_K_CLUSTERS);
-    std.debug.assert(qds.k_clusters >= PROBE_CLUSTERS);
 
-    // Step 1: float Euclidean to every centroid.
+    // Step 1: SIMD centroid distances (one @Vector(14, f32) per cluster).
     var centroid_dists: [MAX_K_CLUSTERS]f32 = undefined;
+    const Vf = @Vector(N_FEATURES, f32);
+    const qv: Vf = q.*;
     for (0..qds.k_clusters) |c| {
-        var d: f32 = 0;
-        inline for (0..N_FEATURES) |k| {
-            const diff = q[k] - qds.centroids[c * N_FEATURES + k];
-            d = @mulAdd(f32, diff, diff, d);
-        }
-        centroid_dists[c] = d;
+        const cv: Vf = qds.centroids[c * N_FEATURES ..][0..N_FEATURES].*;
+        const diff = qv - cv;
+        centroid_dists[c] = @reduce(.Add, diff * diff);
     }
 
-    // Step 2: pick top PROBE_CLUSTERS clusters by smallest distance.
-    var probe_dists: [PROBE_CLUSTERS]f32 = @splat(std.math.inf(f32));
-    var probe_clusters: [PROBE_CLUSTERS]u32 = @splat(0);
-    for (0..qds.k_clusters) |c| {
-        if (centroid_dists[c] < probe_dists[0]) {
-            sift_in_n_min_f32(PROBE_CLUSTERS, &probe_dists, &probe_clusters, centroid_dists[c], @intCast(c));
+    // Step 2: sort cluster indices ascending by centroid distance.
+    var order: [MAX_K_CLUSTERS]u32 = undefined;
+    for (0..qds.k_clusters) |c| order[c] = @intCast(c);
+    const Ctx = struct {
+        dists: *const [MAX_K_CLUSTERS]f32,
+        fn lt(self: @This(), a: u32, b: u32) bool {
+            return self.dists[a] < self.dists[b];
         }
-    }
+    };
+    std.sort.pdq(u32, order[0..qds.k_clusters], Ctx{ .dists = &centroid_dists }, Ctx.lt);
 
-    // Step 3: int Euclidean over rows in selected clusters → tight top-K bound.
+    // Step 3: ordered scan + bbox prune.
     var q_int: [N_FEATURES]i16 = undefined;
     quantize_query(q, &q_int);
 
     var top_dists: [TOP_K]i64 = @splat(std.math.maxInt(i64));
     var top_rows: [TOP_K]u32 = @splat(0);
 
-    var probed: [MAX_K_CLUSTERS]bool = @splat(false);
-    for (probe_clusters[0..]) |c| {
-        probed[c] = true;
+    {
+        const c = order[0];
         const start = qds.cluster_starts[c];
         const end = qds.cluster_starts[c + 1];
         scan_range_int(qds.features, qds.n, start, end, &q_int, &top_dists, &top_rows);
     }
-
-    // Step 4: bbox repair pass over the remaining clusters. Most prune cheaply
-    // (bbox LB > current K-th best); the few that survive get scanned to
-    // guarantee exact top-K.
-    for (0..qds.k_clusters) |c| {
-        if (probed[c]) continue;
+    for (order[1..qds.k_clusters]) |c| {
         const lb = bbox_lower_bound_sq(&q_int, qds.bbox_lo, qds.bbox_hi, c);
         if (lb >= top_dists[0]) continue;
         const start = qds.cluster_starts[c];
@@ -333,26 +327,6 @@ inline fn sift_in_min_i64(
         const tr = rows[i];
         rows[i] = rows[i + 1];
         rows[i + 1] = tr;
-    }
-}
-
-inline fn sift_in_n_min_f32(
-    comptime N: usize,
-    dists: *[N]f32,
-    ids: *[N]u32,
-    new_dist: f32,
-    new_id: u32,
-) void {
-    dists[0] = new_dist;
-    ids[0] = new_id;
-    inline for (0..N - 1) |i| {
-        if (dists[i + 1] <= dists[i]) break;
-        const td = dists[i];
-        dists[i] = dists[i + 1];
-        dists[i + 1] = td;
-        const tr = ids[i];
-        ids[i] = ids[i + 1];
-        ids[i + 1] = tr;
     }
 }
 
