@@ -192,24 +192,35 @@ pub fn euclidean_topk_q_ivf(
 
 /// Axis-aligned squared distance from query to cluster `c`'s bounding box.
 /// Per feature, contributes `(below_lo)²` if `q < lo`, `(above_hi)²` if
-/// `q > hi`, else 0. Widening pattern matches `scan_range_int`.
+/// `q > hi`, else 0. SIMD across all 14 features in one shot —
+/// `@Vector(N_FEATURES, ·)` lanes get padded to 16 by LLVM on aarch64
+/// (4× int32x4 ops), no waste of meaningful work.
 inline fn bbox_lower_bound_sq(
     q_int: *const [N_FEATURES]i16,
     bbox_lo: []const i16,
     bbox_hi: []const i16,
     c: usize,
 ) i64 {
-    var lb: i64 = 0;
-    inline for (0..N_FEATURES) |k| {
-        const lo: i32 = bbox_lo[c * N_FEATURES + k];
-        const hi: i32 = bbox_hi[c * N_FEATURES + k];
-        const qv: i32 = q_int[k];
-        const below_lo: i32 = lo - qv;
-        const above_hi: i32 = qv - hi;
-        const d: i32 = @max(0, @max(below_lo, above_hi));
-        lb += @as(i64, d) * @as(i64, d);
-    }
-    return lb;
+    const Vi16N = @Vector(N_FEATURES, i16);
+    const Vi32N = @Vector(N_FEATURES, i32);
+    const Vi64N = @Vector(N_FEATURES, i64);
+
+    const lo: Vi16N = bbox_lo[c * N_FEATURES ..][0..N_FEATURES].*;
+    const hi: Vi16N = bbox_hi[c * N_FEATURES ..][0..N_FEATURES].*;
+    const qv: Vi16N = q_int.*;
+
+    const lo_i32: Vi32N = lo;
+    const hi_i32: Vi32N = hi;
+    const qv_i32: Vi32N = qv;
+
+    const below_lo: Vi32N = lo_i32 - qv_i32;
+    const above_hi: Vi32N = qv_i32 - hi_i32;
+    const zero: Vi32N = @splat(0);
+    const d: Vi32N = @max(zero, @max(below_lo, above_hi));
+
+    const d_i64: Vi64N = d;
+    const sq: Vi64N = d_i64 * d_i64;
+    return @reduce(.Add, sq);
 }
 
 /// Test-only: scan every cluster (PROBE = K). Used by `dataset_blob.zig`
