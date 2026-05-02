@@ -163,6 +163,162 @@ inline fn sift_in(
     }
 }
 
+/// Generic ascending top-N sift-in. Used for PROBE-cluster selection (N=8).
+inline fn sift_in_n(
+    comptime N: usize,
+    scores: *[N]f32,
+    ids: *[N]u32,
+    new_score: f32,
+    new_id: u32,
+) void {
+    scores[0] = new_score;
+    ids[0] = new_id;
+    inline for (0..N - 1) |i| {
+        if (scores[i + 1] >= scores[i]) break;
+        const ts = scores[i];
+        scores[i] = scores[i + 1];
+        scores[i + 1] = ts;
+        const tr = ids[i];
+        ids[i] = ids[i + 1];
+        ids[i + 1] = tr;
+    }
+}
+
+/// Stack-buffer cap. 4 KB at K=1024.
+const MAX_K_CLUSTERS: usize = 1024;
+const PROBE_CLUSTERS: usize = 8;
+
+/// Production IVF cosine top-K. Score query against all centroids, pick the
+/// top-`PROBE_CLUSTERS` by score, scan only those slabs with the Phase 4
+/// dot-product algebra.
+pub fn cosine_topk_q_ivf(
+    qds: transform_reference.IvfQuantizedDataset,
+    q: *const [N_FEATURES]f32,
+    out: *[TOP_K]u32,
+) void {
+    std.debug.assert(qds.n >= TOP_K);
+    std.debug.assert(qds.k_clusters <= MAX_K_CLUSTERS);
+    std.debug.assert(qds.k_clusters >= PROBE_CLUSTERS);
+
+    // Step 1: dot(q, centroid[c]) for every c.
+    var centroid_scores: [MAX_K_CLUSTERS]f32 = undefined;
+    for (0..qds.k_clusters) |c| {
+        var dot: f32 = 0;
+        inline for (0..N_FEATURES) |k| {
+            dot = @mulAdd(f32, q[k], qds.centroids[c * N_FEATURES + k], dot);
+        }
+        centroid_scores[c] = dot;
+    }
+
+    // Step 2: top-PROBE_CLUSTERS clusters by score (ascending sift).
+    var probe_scores: [PROBE_CLUSTERS]f32 = @splat(-std.math.inf(f32));
+    var probe_clusters: [PROBE_CLUSTERS]u32 = @splat(0);
+    for (0..qds.k_clusters) |c| {
+        if (centroid_scores[c] > probe_scores[0]) {
+            sift_in_n(PROBE_CLUSTERS, &probe_scores, &probe_clusters, centroid_scores[c], @intCast(c));
+        }
+    }
+
+    // Step 3: scan rows in selected clusters.
+    scan_clusters(qds, q, probe_clusters[0..], out);
+}
+
+/// Test-only: scan every cluster (PROBE = K). Used by `dataset_blob.zig`
+/// equivalence tests against `cosine_topk_q` with K small enough that PROBE
+/// would be ≥ K. Iterates `qds.cluster_starts` directly so it's correct for
+/// any `k_clusters`.
+pub fn cosine_topk_q_ivf_full(
+    qds: transform_reference.IvfQuantizedDataset,
+    q: *const [N_FEATURES]f32,
+    out: *[TOP_K]u32,
+) void {
+    std.debug.assert(qds.n >= TOP_K);
+
+    var const_q: f32 = 0;
+    var q_eff: [N_FEATURES]Vec = undefined;
+    inline for (0..N_FEATURES) |k| {
+        const_q += q[k] * qds.mins[k];
+        q_eff[k] = @splat(q[k] * qds.inv_scales[k]);
+    }
+
+    var top_scores: [TOP_K]f32 = @splat(-std.math.inf(f32));
+    var top_rows: [TOP_K]u32 = @splat(0);
+
+    const n = qds.n;
+    const features = qds.features;
+
+    for (0..qds.k_clusters) |c| {
+        const start = qds.cluster_starts[c];
+        const end = qds.cluster_starts[c + 1];
+        scan_one(features, n, start, end, const_q, q_eff, q, qds.inv_scales, &top_scores, &top_rows);
+    }
+
+    inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
+}
+
+inline fn scan_clusters(
+    qds: transform_reference.IvfQuantizedDataset,
+    q: *const [N_FEATURES]f32,
+    cluster_ids: []const u32,
+    out: *[TOP_K]u32,
+) void {
+    var const_q: f32 = 0;
+    var q_eff: [N_FEATURES]Vec = undefined;
+    inline for (0..N_FEATURES) |k| {
+        const_q += q[k] * qds.mins[k];
+        q_eff[k] = @splat(q[k] * qds.inv_scales[k]);
+    }
+
+    var top_scores: [TOP_K]f32 = @splat(-std.math.inf(f32));
+    var top_rows: [TOP_K]u32 = @splat(0);
+
+    const n = qds.n;
+    const features = qds.features;
+
+    for (cluster_ids) |c| {
+        const start = qds.cluster_starts[c];
+        const end = qds.cluster_starts[c + 1];
+        scan_one(features, n, start, end, const_q, q_eff, q, qds.inv_scales, &top_scores, &top_rows);
+    }
+
+    inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
+}
+
+inline fn scan_one(
+    features: []const u16,
+    n: usize,
+    start: u32,
+    end: u32,
+    const_q: f32,
+    q_eff: [N_FEATURES]Vec,
+    q: *const [N_FEATURES]f32,
+    inv_scales: [N_FEATURES]f32,
+    top_scores: *[TOP_K]f32,
+    top_rows: *[TOP_K]u32,
+) void {
+    var row: usize = start;
+    while (row + W <= end) : (row += W) {
+        var dot: Vec = @splat(const_q);
+        inline for (0..N_FEATURES) |k| {
+            const r_u16: Vu16 = features[k * n + row ..][0..W].*;
+            const r_f32: Vec = @floatFromInt(r_u16);
+            dot = @mulAdd(Vec, q_eff[k], r_f32, dot);
+        }
+        inline for (0..W) |lane| {
+            const s = dot[lane];
+            if (s > top_scores[0]) sift_in(top_scores, top_rows, s, @intCast(row + lane));
+        }
+    }
+    while (row < end) : (row += 1) {
+        var dot: f32 = const_q;
+        inline for (0..N_FEATURES) |k| {
+            const r_f32: f32 = @floatFromInt(features[k * n + row]);
+            dot = @mulAdd(f32, q[k] * inv_scales[k], r_f32, dot);
+        }
+        if (dot > top_scores[0]) sift_in(top_scores, top_rows, dot, @intCast(row));
+    }
+}
+
 // ─── tests ──────────────────────────────────────────────────────────────────
 
 const fast_json = @import("fast_json.zig");
@@ -309,6 +465,92 @@ test "cosine_topk vs naive on example-references.json" {
             return err;
         };
     }
+}
+
+test "cosine_topk_q_ivf hand-built tiny clustered dataset" {
+    // 10 rows in 14 features. Rows 0..4 cluster around +e0, rows 5..9 around +e1.
+    // K=2, PROBE=8 (capped to k_clusters=2 effectively, but we use _full for clarity).
+    // Query toward +e0 must return rows 0..4 (the cluster near +e0).
+    const n: usize = 10;
+    const k_clusters: usize = 2;
+
+    // Build f32 unit-norm rows.
+    var f32_features: [N_FEATURES * n]f32 = @splat(0);
+    var labels: [n]bool = @splat(false);
+    for (0..5) |row| {
+        f32_features[0 * n + row] = 1.0;
+        f32_features[2 * n + row] = 0.001 * @as(f32, @floatFromInt(row));
+        // Renormalize.
+        var sum_sq: f32 = 0;
+        for (0..N_FEATURES) |k| sum_sq += f32_features[k * n + row] * f32_features[k * n + row];
+        const inv = 1.0 / @sqrt(sum_sq);
+        for (0..N_FEATURES) |k| f32_features[k * n + row] *= inv;
+    }
+    for (5..10) |row| {
+        f32_features[1 * n + row] = 1.0;
+        f32_features[3 * n + row] = 0.001 * @as(f32, @floatFromInt(row));
+        var sum_sq: f32 = 0;
+        for (0..N_FEATURES) |k| sum_sq += f32_features[k * n + row] * f32_features[k * n + row];
+        const inv = 1.0 / @sqrt(sum_sq);
+        for (0..N_FEATURES) |k| f32_features[k * n + row] *= inv;
+    }
+
+    // Quantize per-column.
+    var mins: [N_FEATURES]f32 = undefined;
+    var inv_scales: [N_FEATURES]f32 = undefined;
+    var u16_features: [N_FEATURES * n]u16 = @splat(0);
+    for (0..N_FEATURES) |k| {
+        var lo: f32 = f32_features[k * n + 0];
+        var hi: f32 = f32_features[k * n + 0];
+        for (1..n) |r| {
+            const v = f32_features[k * n + r];
+            lo = @min(lo, v);
+            hi = @max(hi, v);
+        }
+        const range = hi - lo;
+        const scale: f32 = if (range > 0) 65535.0 / range else 0.0;
+        mins[k] = lo;
+        inv_scales[k] = if (scale != 0) 1.0 / scale else 0.0;
+        for (0..n) |r| {
+            const f = f32_features[k * n + r];
+            const q = @round((f - lo) * scale);
+            const clamped = @max(0.0, @min(65535.0, q));
+            u16_features[k * n + r] = @intFromFloat(clamped);
+        }
+    }
+
+    // Centroids: hand-pick (would be the kmeans output on this layout).
+    // Centroid 0 = [1, 0, 0, ...], Centroid 1 = [0, 1, 0, ...].
+    var centroids: [k_clusters * N_FEATURES]f32 = @splat(0);
+    centroids[0 * N_FEATURES + 0] = 1.0;
+    centroids[1 * N_FEATURES + 1] = 1.0;
+
+    // Cluster starts: rows 0..4 in cluster 0, rows 5..9 in cluster 1.
+    const cluster_starts = [_]u32{ 0, 5, 10 };
+
+    const qds: transform_reference.IvfQuantizedDataset = .{
+        .n = n,
+        .k_clusters = k_clusters,
+        .features = &u16_features,
+        .labels = &labels,
+        .centroids = &centroids,
+        .cluster_starts = &cluster_starts,
+        .mins = mins,
+        .inv_scales = inv_scales,
+    };
+
+    // Query toward +e0 — should return rows 0..4 (cluster 0 wins).
+    var q: [N_FEATURES]f32 = @splat(0);
+    q[0] = 1.0;
+
+    var out: [TOP_K]u32 = undefined;
+    cosine_topk_q_ivf_full(qds, &q, &out);
+
+    // The 5 rows of cluster 0 (rows 0..4) — order by score descending. Row 0
+    // has 0 jitter on f2 so it's exactly e0 → highest cosine. Rows 1..4 have
+    // tiny jitter pulling them slightly off e0, so cosine decreases as jitter
+    // grows.
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4 }, &out);
 }
 
 test "cosine_topk_q hand-built tiny dataset" {

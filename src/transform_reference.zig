@@ -18,14 +18,6 @@ pub const Dataset = struct {
     n: usize,
     features: []const f32,
     labels: []const bool,
-
-    pub fn col(self: Dataset, c: usize) []const f32 {
-        return self.features[c * self.n .. (c + 1) * self.n];
-    }
-
-    pub fn feature(self: Dataset, row: usize, c: usize) f32 {
-        return self.features[c * self.n + row];
-    }
 };
 
 /// Quantized SoA view over a u16-encoded dataset (the on-disk v2 format).
@@ -43,10 +35,24 @@ pub const QuantizedDataset = struct {
     labels: []const bool,
     mins: [N_FEATURES]f32,
     inv_scales: [N_FEATURES]f32,
+};
 
-    pub fn col(self: QuantizedDataset, c: usize) []const u16 {
-        return self.features[c * self.n .. (c + 1) * self.n];
-    }
+/// IVF-augmented quantized SoA view: rows are reordered cluster-by-cluster
+/// (so cluster `c` occupies `[cluster_starts[c], cluster_starts[c+1])` in
+/// every feature column), with `centroids` row-major over `[k_clusters][14]f32`.
+///
+/// Search picks the top-N centroids by `dot(q, centroid)` then scans only
+/// those clusters' row slices. The u16 features and per-feature
+/// `(min, inv_scale)` are identical in shape and meaning to `QuantizedDataset`.
+pub const IvfQuantizedDataset = struct {
+    n: usize,
+    k_clusters: usize,
+    features: []const u16,
+    labels: []const bool,
+    centroids: []const f32,
+    cluster_starts: []const u32,
+    mins: [N_FEATURES]f32,
+    inv_scales: [N_FEATURES]f32,
 };
 
 pub const Error = fast_json.ParseError || error{BufferTooSmall};

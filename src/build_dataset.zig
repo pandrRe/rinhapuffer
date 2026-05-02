@@ -24,10 +24,22 @@ pub fn main(init: std.process.Init) !void {
     const ds = try rinhapuffer.transform_reference.parse_into(mapped.bytes, features, labels);
 
     const cwd = std.Io.Dir.cwd();
-    try rinhapuffer.dataset_blob.write(init.io, cwd, OUTPUT_SUB_PATH, ds);
+    try rinhapuffer.dataset_blob.write(
+        allocator,
+        init.io,
+        cwd,
+        OUTPUT_SUB_PATH,
+        ds,
+        rinhapuffer.dataset_blob.K_CLUSTERS,
+    );
 
     std.debug.print(
-        "wrote {s}: {d} records, {d} bytes\n",
-        .{ OUTPUT_SUB_PATH, ds.n, rinhapuffer.dataset_blob.blob_size(@intCast(ds.n)) },
+        "wrote {s}: {d} records, {d} bytes (K={d} clusters)\n",
+        .{
+            OUTPUT_SUB_PATH,
+            ds.n,
+            rinhapuffer.dataset_blob.blob_size(@intCast(ds.n), rinhapuffer.dataset_blob.K_CLUSTERS),
+            rinhapuffer.dataset_blob.K_CLUSTERS,
+        },
     );
 }
