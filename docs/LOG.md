@@ -114,3 +114,22 @@
   - Bench delta: `cosine_topk` warm min 3.31 ms, p99 4.55 ms, **906M rows/s** — within noise of parse-backed numbers (3.25 ms / 922M). Confirms file-mapped pages and anonymous heap perform identically once resident on Apple Silicon.
 - One commit landed
   - `chore: bench cosine_topk via mmapped dataset.bin`
+- Phase 4 — u16 quantization + on-disk format v2
+  - 4.1: `dataset_blob.compute_quant_params(features, n)` — single linear pass per column to find `(min, max)`, then `scale = 65535 / range` (or `0` for a degenerate constant column).
+  - 4.2: format bumped to v2. `Header` grew from 16 → 128 bytes via a new `quant_params: [14]QuantParam` field (`extern struct { min: f32, scale: f32 }`). Features became `u16` column-major. Labels unchanged. `blob_size(n) = 128 + 28n + n`. v1 blobs are now rejected with `UnsupportedVersion`.
+  - 4.3: `dataset_blob.write(io, dir, sub_path, ds)` learned to quantize in-line. Walks 14 columns × 2048-row chunks, encodes via `q = clamp(@round((f - min) * scale), 0, 65535)` into a 4 KiB stack `[2048]u16` buffer, streams each chunk through `writeStreamingAll`. Zero allocator usage; transient memory is one stack buffer. Labels write unchanged.
+  - 4.4: `dataset_blob.load(path)` returns a `QuantizedBlob { mapped, dataset: QuantizedDataset }`. `QuantizedDataset { n, features: []const u16, labels: []const bool, mins: [14]f32, inv_scales: [14]f32 }` lives in `transform_reference.zig` parallel to `Dataset`. `inv_scales` is computed once at `load` time (14 reciprocals at boot) so the search hot loop never divides.
+  - 4.5: `search.cosine_topk_q(qds, q, out)` — algebraic refactor avoids per-row affine reconstruction. Per query: `const_q = Σ q[k]*mins[k]`, `q_eff[k] = q[k]*inv_scales[k]` (precomputed once, ~30 fmuls). Inner loop is one `@floatFromInt(@Vector(8, u16)) → @Vector(8, f32)` convert + one FMA per feature, with `dot` initialized to `@splat(const_q)`. The original f32 `cosine_topk` stays as the differential reference and the in-memory test path.
+  - 4.6: tests rewritten for v2. Round-trip on `example-references.json` now asserts: `qds.labels` matches bytewise, `qds.mins[k]` and `qds.inv_scales[k]` match recomputed params + reciprocals, per-element `|f_orig - dequant(q_u16)| ≤ range_k / 65535` (1 ulp of quantization step). Top-K equivalence runs `cosine_topk` (f32 in-memory) vs `cosine_topk_q` (loaded u16) on 3 queries — 0 swaps, all pass. Bad-header cases extended: zero magic, version=99, version=1 (locks v1 readers out), truncated body. Plus `cosine_topk_q` tiny-dataset test in `search.zig`. **44/44 tests pass.**
+  - 4.7: `zig build prep` produces `resources/dataset.bin` of exactly **87,000,128 bytes** (= 128 + 14 × 3M × 2 + 3M) — down from 171 MB. Header dump verified: magic `0x31504252`, version `2`, n `3_000_000`, pad `0`.
+  - 4.8: `dataset_blob.load_unquant(allocator, path)` added — dequantizes the v2 blob into an owned 168 MB f32 buffer + 3 MB labels copy. Production never pays this; it's purely so the bench can pit f32 vs u16 over the same on-disk artifact.
+  - 4.9: bench delta on Apple Silicon (M-series, dev box, both paths over the same v2 blob):
+    - `dataset_blob.load`: warm min **7 µs** (file size now 83 MiB on disk, was 163 MiB).
+    - `cosine_topk_q` (u16): warm min **4.16 ms**, p50 4.27 ms, p99 4.73 ms — **721M rows/s**.
+    - `cosine_topk` (f32, dequantized via `load_unquant`): warm min **3.41 ms**, p50 3.63 ms, p99 5.28 ms — **880M rows/s**.
+    - The u16 path is ~22% slower on warm min on this CPU but has a lower p99 (less L2 pressure under load). Apple Silicon has abundant FMA throughput and DRAM bandwidth; the convert chain (`UXTL → UCVTF → FMLA`) extends the per-feature serial dependency. Tried a 2-way split-accumulator unroll — net-negative (4.27 ms), reverted.
+    - Throughput ranking is expected to flip on x86_64 Linux at 0.25 CPU (the rinha deployment target), where bandwidth is scarcer relative to FMA. Phase 9 tuning can revisit if it matters.
+  - 4.10: RAM goal — the actual point of Phase 4 — met. **84 MB resident features** + 0.4 MB labels fits the 150 MB cap with headroom for the binary, query buffers, IVF index (Phase 5), and HTTP handler state.
+  - 4.11: deviations from `docs/PLAN.md` (carried over from Phase 3): labels still stored as `[n]u8` not a bitset. Conflating a bitset rev with the quantization rev would have churned `search.zig` for a 2.6 MB win on top of the 84 MB feature reduction.
+- One commit landed
+  - `feat: u16 quantized dataset.bin (v2) + quantized cosine top-K`
