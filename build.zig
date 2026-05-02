@@ -67,30 +67,42 @@ pub fn build(b: *std.Build) void {
     //
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
+    const exe_mod = b.createModule(.{
+        // b.createModule defines a new module just like b.addModule but,
+        // unlike b.addModule, it does not expose the module to consumers of
+        // this package, which is why in this case we don't have to give it a name.
+        .root_source_file = b.path("src/main.zig"),
+        // Target and optimization levels must be explicitly wired in when
+        // defining an executable or library (in the root module), and you
+        // can also hardcode a specific target for an executable or library
+        // definition if desireable (e.g. firmware for embedded devices).
+        .target = target,
+        .optimize = optimize,
+        // libc is required: the server uses `std.c.{socket,bind,listen,...}`
+        // and `fast_json.zig` calls `libc.lseek`. On Darwin libSystem is
+        // auto-linked; on cross-compile targets (musl) we must opt in.
+        .link_libc = true,
+        // No DWARF in the shipped binary — runtime image is `scratch`, no
+        // stacktrace consumer anyway, and stripping cuts ~3.5 MB.
+        .strip = if (optimize == .Debug) null else true,
+        // List of modules available for import in source files part of the
+        // root module.
+        .imports = &.{
+            // Here "rinhapuffer" is the name you will use in your source code to
+            // import this module (e.g. `@import("rinhapuffer")`). The name is
+            // repeated because you are allowed to rename your imports, which
+            // can be extremely useful in case of collisions (which can happen
+            // importing modules from different packages).
+            .{ .name = "rinhapuffer", .module = mod },
+        },
+    });
+    // The shared `mod` (root.zig) is also a libc consumer via
+    // `dataset_blob.zig` (mmap/close) and `fast_json.zig` (fstat). Tests of
+    // that module need libc as well.
+    mod.link_libc = true;
     const exe = b.addExecutable(.{
         .name = "rinhapuffer",
-        .root_module = b.createModule(.{
-            // b.createModule defines a new module just like b.addModule but,
-            // unlike b.addModule, it does not expose the module to consumers of
-            // this package, which is why in this case we don't have to give it a name.
-            .root_source_file = b.path("src/main.zig"),
-            // Target and optimization levels must be explicitly wired in when
-            // defining an executable or library (in the root module), and you
-            // can also hardcode a specific target for an executable or library
-            // definition if desireable (e.g. firmware for embedded devices).
-            .target = target,
-            .optimize = optimize,
-            // List of modules available for import in source files part of the
-            // root module.
-            .imports = &.{
-                // Here "rinhapuffer" is the name you will use in your source code to
-                // import this module (e.g. `@import("rinhapuffer")`). The name is
-                // repeated because you are allowed to rename your imports, which
-                // can be extremely useful in case of collisions (which can happen
-                // importing modules from different packages).
-                .{ .name = "rinhapuffer", .module = mod },
-            },
-        }),
+        .root_module = exe_mod,
     });
 
     // This declares intent for the executable to be installed into the

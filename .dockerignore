@@ -1,0 +1,7 @@
+# Build context only needs the two prebuilt artifacts COPY'd in the Dockerfile.
+# Everything else is excluded.
+*
+
+# Re-include the artifacts.
+!zig-out/bin/rinhapuffer
+!resources/dataset.bin

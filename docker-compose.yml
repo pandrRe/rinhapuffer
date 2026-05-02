@@ -1,0 +1,62 @@
+# Phase 8 — rinha-spec topology: HAProxy fronts two rinhapuffer instances over
+# Unix domain sockets in a shared tmpfs volume. 1.0 CPU + 350 MB total split
+# across the three services. Bridge network only (default).
+#
+# Default image is the ghcr.io public tag (what the rinha eval pulls).
+# Override for local-arch testing:
+#   TARGET_ARCH=arm64 IMAGE=1 ./build.sh
+#   RINHAPUFFER_IMAGE=localhost/rinhapuffer:arm64 podman compose up
+# Or amd64 under qemu on Apple Silicon:
+#   IMAGE=1 ./build.sh
+#   RINHAPUFFER_IMAGE=localhost/rinhapuffer:amd64 podman compose up
+#
+# `podman compose up` with no override pulls ghcr.io/pandrre/rinhapuffer:latest.
+
+services:
+  lb:
+    image: haproxy:3.0-alpine
+    ports:
+      - "9999:9999"
+      - "127.0.0.1:8404:8404"  # haproxy stats (loopback only — local debug)
+    volumes:
+      - ./infra/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - sockets:/sockets
+    depends_on:
+      - api1
+      - api2
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "30MB"
+
+  api1:
+    image: ${RINHAPUFFER_IMAGE:-ghcr.io/pandrre/rinhapuffer:latest}
+    environment:
+      - RINHAPUFFER_SOCKET=/sockets/api1.sock
+    volumes:
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "160MB"
+
+  api2:
+    image: ${RINHAPUFFER_IMAGE:-ghcr.io/pandrre/rinhapuffer:latest}
+    environment:
+      - RINHAPUFFER_SOCKET=/sockets/api2.sock
+    volumes:
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "160MB"
+
+volumes:
+  # Plain named volume — UDS bind() needs a real directory the container
+  # process can write into. (tmpfs `driver_opts` aren't honored uniformly
+  # across podman versions; the rinhapuffer process unlinks any stale
+  # socket on bind anyway, so persistence between runs is harmless.)
+  sockets:

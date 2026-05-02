@@ -326,9 +326,13 @@ pub fn mmap_file(path: []const u8) MmapError!Mapped {
     const fd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0);
     errdefer _ = libc.close(fd);
 
-    var st: libc.Stat = undefined;
-    if (libc.fstat(fd, &st) != 0) return error.StatFailed;
-    const len: usize = @intCast(st.size);
+    // Cross-platform file-size lookup via lseek(fd, 0, SEEK_END). Avoids
+    // libc.fstat which is wrapped on Darwin but not on Linux in zig 0.16
+    // (linux uses statx). lseek's the smallest portable surface that works
+    // on both targets without conditional compilation.
+    const end_off = libc.lseek(fd, 0, libc.SEEK.END);
+    if (end_off < 0) return error.StatFailed;
+    const len: usize = @intCast(end_off);
 
     if (len == 0) {
         return .{ .bytes = &.{}, .fd = fd };
