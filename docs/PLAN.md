@@ -170,7 +170,17 @@ Goal: 100% accuracy via correctness-by-construction. Per-cluster axis-aligned `[
 - [x] **7.7.3** `search.euclidean_topk_q_ivf` adds a fourth step: bbox repair pass over unprobed clusters. PROBE stays at 8.
 - [x] **7.7.4** Re-prep, smoke, diagnose, k6.
 
-**Result**: **errors 7 → 0** (100% accuracy, FP=0, FN=0). `detection_score` pegged at formula max 3000. But **p99 0.62 ms → 4.72 ms** under k6's 250-VU concurrency — bbox prune costs more under contention than expected. **Final score 5,676.25 → 5,326.02** (-350). Architecture correct (exact by construction) but needs latency optimization to recover the score: sort unprobed clusters by centroid distance + SIMD the LB compute. Phase 7.8 candidate.
+**Result**: **errors 7 → 0** (100% accuracy, FP=0, FN=0). `detection_score` pegged at formula max 3000. But **p99 0.62 ms → 4.72 ms** under k6's 250-VU concurrency — bbox prune costs more under contention than expected. **Final score 5,676.25 → 5,326.02** (-350). Architecture correct (exact by construction) but needs latency optimization to recover the score.
+
+---
+
+## Phase 7.7.1 — SIMD `bbox_lower_bound_sq`
+
+Goal: recover the p99 hit from Phase 7.7. The new bbox LB compute was the only scalar function on the hot path; `scan_range_int` was already SIMD'd at W=8.
+
+- [x] **7.7.1.1** Vectorize `bbox_lower_bound_sq` across all 14 features using `@Vector(N_FEATURES, ·)`. LLVM pads to 16 lanes on aarch64; per cluster goes from ~84 scalar i32 ops to ~8 SIMD ops.
+
+**Result**: **k6 final score 5,326.02 → 6,000.00 (max possible)**. FP=0, FN=0, http_errors=0. **p99 4.72 ms → 0.78 ms** (-83%). Both `p99_score` and `detection_score` pegged at the formula maximum 3000 each. **Six perfect zeros** (errors, http_errors, failure_rate, weighted_errors, error_rate_epsilon, absolute_penalty).
 
 ---
 
