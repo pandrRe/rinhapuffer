@@ -135,6 +135,19 @@ Goal: end-to-end. Real fraud scoring through the HTTP path.
 
 ---
 
+## Phase 7.5 — Switch search from L2-normalized cosine to raw-feature Euclidean
+
+Goal: eliminate the 298/299 FP+FN caused by dataset L2-normalization (diagnosed by `scripts/diagnose.py`). Switch the entire search pipeline to plain Euclidean over raw [0,1] ∪ {−1} features. RAM unchanged (u16 quantization stays).
+
+- [x] **7.5.1** Bulk rename `cosine_topk*` → `euclidean_topk*` (no behavior change).
+- [x] **7.5.2** Drop L2-normalize in `transform_reference.parse_into`. Switch `kmeans` to plain Euclidean (no centroid renormalize, `assign_all` argmin-Euclidean). Bump `dataset_blob.VERSION` 3 → 4. Rewrite `search` inner loops as `score = q·r − ½‖r‖²` (per-query precompute: `score_const`, `lin_eff`, `neg_half_quad`). Centroid scoring switches to `dot(q, c) − ½‖c‖²`. `naive_cosine_topk` → `naive_euclidean_topk` (f64 brute-force).
+- [x] **7.5.3** `zig build prep` regenerates `resources/dataset.bin` (v4, same 87 MB).
+- [x] **7.5.4** Smoke + diagnose + k6.
+
+**Result**: errors 299 → 8 (99.45% → 99.99% accuracy). k6 final score **4,122 → 5,647.17** (+37%). p99 = 0.91 ms (slightly better than before despite 2× inner-loop ops). 0 HTTP errors. Both `p99_score` and `detection_score.rate_component` hit their formula maxima.
+
+---
+
 ## Phase 8 — Containerize against the rinha spec
 
 Goal: hand a docker image that the rinha harness can run.
