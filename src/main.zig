@@ -10,9 +10,11 @@
 //! over UDS). Otherwise the server binds TCP `0.0.0.0:9999`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const rinhapuffer = @import("rinhapuffer");
 const http = rinhapuffer.http;
 const handler = rinhapuffer.handler;
+const http_async = rinhapuffer.http_async;
 const libc = std.c;
 
 const PORT: u16 = 9999;
@@ -26,24 +28,30 @@ pub fn main(_: std.process.Init) !void {
         if (libc.getenv(SOCKET_ENV)) |raw| {
             const path = std.mem.span(@as([*:0]const u8, raw));
             const fd = try http.bind_listen_unix(path);
-            std.debug.print("rinhapuffer listening on unix:{s} (keep-alive {s})\n", .{
+            std.debug.print("rinhapuffer listening on unix:{s} (keep-alive {s}, accept {s})\n", .{
                 path,
                 if (handler.KEEP_ALIVE) "on" else "off",
+                if (builtin.os.tag == .linux) "epoll" else "blocking",
             });
             break :blk fd;
         }
         const fd = try http.bind_listen(PORT);
-        std.debug.print("rinhapuffer listening on 0.0.0.0:{d} (keep-alive {s})\n", .{
+        std.debug.print("rinhapuffer listening on 0.0.0.0:{d} (keep-alive {s}, accept {s})\n", .{
             PORT,
             if (handler.KEEP_ALIVE) "on" else "off",
+            if (builtin.os.tag == .linux) "epoll" else "blocking",
         });
         break :blk fd;
     };
     defer _ = libc.close(listen_fd);
 
-    while (true) {
-        const client_fd = try http.accept_one(listen_fd);
-        defer _ = libc.close(client_fd);
-        http.serve(client_fd, &handler.dispatch);
+    if (comptime builtin.os.tag == .linux) {
+        try http_async.run(@intCast(listen_fd), &handler.dispatch);
+    } else {
+        while (true) {
+            const client_fd = try http.accept_one(listen_fd);
+            defer _ = libc.close(client_fd);
+            http.serve(client_fd, &handler.dispatch);
+        }
     }
 }

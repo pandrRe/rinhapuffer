@@ -56,11 +56,11 @@ fi
 # ─── 2. rinhapuffer binary (cross-compile to linux-musl) ────────────────────
 
 echo "==> build rinhapuffer for ${ZIG_TARGET}"
-# Keep-alive OFF (default): the single-threaded blocking accept loop runs
-# one request lifecycle per connection before looping back to accept the
-# next one — so persistent connections head-of-line everything else parked
-# in the queue. HAProxy uses `http-server-close` for the same reason.
-zig build -Doptimize=ReleaseFast -Dtarget="${ZIG_TARGET}"
+# Linux artifact uses the epoll async accept loop (Phase 9.2) which holds
+# many persistent conns concurrently — HoL on idle keep-alive is no longer
+# a concern. Mac native build keeps the blocking accept loop and defaults
+# `-Dkeep-alive=false` (per `build.zig`).
+zig build -Doptimize=ReleaseFast -Dtarget="${ZIG_TARGET}" -Dkeep-alive=true
 
 echo
 echo "==> artifacts"
