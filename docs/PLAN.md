@@ -184,17 +184,20 @@ Goal: recover the p99 hit from Phase 7.7. The new bbox LB compute was the only s
 
 ---
 
-## Phase 8 — Containerize against the rinha spec
+## Phase 8 — Containerize: HAProxy + 2× rinhapuffer over Unix sockets
 
-Goal: hand a docker image that the rinha harness can run.
+Goal: hand the rinha eval a `docker-compose.yml` matching the spec topology
+(≥ 1 LB + ≥ 2 API instances, ≤ 1.0 CPU + ≤ 350 MB total, bridge network,
+port 9999). HAProxy fronts two rinhapuffer instances over a shared sockets
+volume so the LB-to-app hop is plain UDS.
 
-- [ ] **8.1** Multi-stage `Dockerfile`: stage 1 builds Zig + runs `prep` to produce `dataset.bin`; stage 2 is a `scratch`/`alpine` runtime image with the binary + the blob.
-- [ ] **8.2** `docker-compose.yaml` with the 0.25 CPU + 150 MB cap matching the spec.
-- [ ] **8.3** Smoke-test under the cap: `docker compose up`, run the example payloads, verify `/ready` flips < 5 s.
-- [ ] **8.4** Confirm RSS stays under 150 MB during a sustained load run.
-- [ ] **8.5** Commit.
+- [x] **8.1** UDS bind. `http.bind_listen_unix(path)` + `RINHAPUFFER_SOCKET` env switch in `main.zig`. +2 tests; native curl smoke clean.
+- [x] **8.2** Host-side cross-compile + `scratch` image. `build.sh` runs prep natively (LE-portable blob) and cross-compiles to `x86_64-linux-musl` (or arm64 via `TARGET_ARCH=arm64`). `Dockerfile` is single-stage `FROM scratch` + COPY of the prebuilt artifacts; `.dockerignore` keeps build context to 84 MB. `link_libc = true` and `strip = true` shrink the binary 4.4 MB → 396 KB. `fast_json.zig` swaps `libc.fstat` → `libc.lseek(SEEK.END)` for cross-platform portability.
+- [x] **8.3** `infra/haproxy.cfg`: `mode http` + `balance roundrobin` over UDS, `option redispatch` for backend failover, stats on `:8404`.
+- [x] **8.4** `docker-compose.yml`: lb 0.10 cpu / 30 MB + api1 0.45 cpu / 160 MB + api2 0.45 cpu / 160 MB = 1.0 cpu / 350 MB exact. Bridge network, only port 9999 exposed.
+- [x] **8.5** Verify locally with podman: round-robin (20 reqs → 10/10 split), failover (kill api2 → 6/6 still 200), resource caps honoured. **k6 vs native arm64 stack: FP=0, FN=0, score 3651.66, p99 223 ms** (cgroup CPU split + UDS hop + macOS→VM forward — real linux numbers will be much better).
 
-**Exit criterion**: image runs the rinha harness end-to-end without OOM or timeout.
+**Exit criterion** (met locally): `podman compose up` brings the spec topology online with correctness preserved through the haproxy hop. Real eval numbers come from pushing to a public registry and running on linux-amd64 hardware.
 
 ---
 
