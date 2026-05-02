@@ -57,6 +57,7 @@ pub const ListenError = error{
     SetsockoptFailed,
     BindFailed,
     ListenFailed,
+    PathTooLong,
 };
 
 pub const AcceptError = error{ AcceptFailed };
@@ -222,6 +223,40 @@ pub fn bind_listen(port: u16) ListenError!libc.fd_t {
         .addr = 0, // INADDR_ANY
     };
     if (libc.bind(fd, @ptrCast(&sin), @sizeOf(@TypeOf(sin))) != 0) return error.BindFailed;
+    if (libc.listen(fd, LISTEN_BACKLOG) != 0) return error.ListenFailed;
+    return fd;
+}
+
+/// Open + bind + listen on a Unix domain stream socket at `path`. Unlinks any
+/// existing entry first, then `chmod 666` after bind so a load balancer
+/// running under a different UID can connect. Returns the listening fd.
+///
+/// Path limit is the OS `sun_path` size (104 on Darwin, 108 on Linux). We
+/// reject paths longer than 103 bytes (one byte reserved for NUL) to keep
+/// behavior identical across both targets.
+pub fn bind_listen_unix(path: []const u8) ListenError!libc.fd_t {
+    const SunPath = @FieldType(libc.sockaddr.un, "path");
+    const max_path = @typeInfo(SunPath).array.len - 1;
+    if (path.len > max_path) return error.PathTooLong;
+
+    const fd = libc.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    if (fd < 0) return error.SocketFailed;
+    errdefer _ = libc.close(fd);
+
+    var sa: libc.sockaddr.un = .{ .path = @splat(0) };
+    @memcpy(sa.path[0..path.len], path);
+    // Null terminator already in place via @splat(0); make the cast intent explicit.
+    const path_z: [*:0]const u8 = @ptrCast(&sa.path);
+
+    _ = libc.unlink(path_z); // ignore ENOENT — only fatal failure modes matter on bind
+
+    if (libc.bind(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa))) != 0) return error.BindFailed;
+
+    // Make the socket reachable from a peer running as a different UID
+    // (haproxy in its own container). Best-effort — failure isn't fatal for
+    // the bind itself; the connect attempt will surface any permission issue.
+    _ = libc.chmod(path_z, 0o666);
+
     if (libc.listen(fd, LISTEN_BACKLOG) != 0) return error.ListenFailed;
     return fd;
 }
@@ -558,6 +593,62 @@ fn test_recv_until_close(fd: libc.fd_t, buf: []u8) !usize {
         have += @intCast(rc);
     }
     return have;
+}
+
+fn test_client_connect_unix(path: []const u8) !libc.fd_t {
+    const fd = libc.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    if (fd < 0) return error.SocketFailed;
+    var sa: libc.sockaddr.un = .{ .path = @splat(0) };
+    @memcpy(sa.path[0..path.len], path);
+    sa.path[path.len] = 0;
+    if (libc.connect(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa))) != 0) {
+        _ = libc.close(fd);
+        return error.ConnectFailed;
+    }
+    return fd;
+}
+
+test "bind_listen_unix — rejects path longer than sun_path" {
+    var long: [200]u8 = undefined;
+    @memset(&long, 'a');
+    try std.testing.expectError(error.PathTooLong, bind_listen_unix(&long));
+}
+
+test "serve_one end-to-end over a unix domain socket" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &dir_buf);
+    const sock_path = try std.fmt.allocPrint(allocator, "{s}/api.sock", .{dir_buf[0..dir_len]});
+    defer allocator.free(sock_path);
+
+    const listen_fd = try bind_listen_unix(sock_path);
+    defer _ = libc.close(listen_fd);
+
+    const Server = struct {
+        fn run(fd: libc.fd_t) void {
+            serve_one(fd, &test_dispatch);
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Server.run, .{listen_fd});
+
+    const client_fd = try test_client_connect_unix(sock_path);
+    defer _ = libc.close(client_fd);
+
+    try test_send_all(client_fd, "GET /ready HTTP/1.1\r\nHost: x\r\n\r\n");
+    try test_send_all(client_fd, "POST /fraud-score HTTP/1.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+
+    var buf: [4096]u8 = undefined;
+    const n = try test_recv_until_close(client_fd, &buf);
+    const got = buf[0..n];
+
+    try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, got, FRAUD_STUB) != null);
+
+    thread.join();
 }
 
 test "serve_one end-to-end via raw libc client" {
