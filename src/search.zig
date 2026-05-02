@@ -342,10 +342,22 @@ inline fn scan_cluster_blocks(
         }
 
         const lane_row_base: u32 = @intCast(row_base + (b - block_start) * BLOCK_W);
+        // Mask sift to lanes within the cluster's canonical row range.
+        // Full blocks: valid_lanes == BLOCK_W (all 8 fire, predictor stays
+        // correct). Last block of a cluster with rc % W != 0: padding lanes
+        // hold sentinel features that produce huge sentinel distances —
+        // even though those distances exceed any real one, top_dists[0]
+        // starts at INT64_MAX and the very first scanned cluster would
+        // sift padding rows in with invalid row indices, then label_at()
+        // would read the labels bitset out of bounds (segfault → 500).
+        const ce: u32 = qds.cluster_starts[c + 1];
+        const valid_lanes: u32 = if (lane_row_base >= ce) 0 else @min(@as(u32, BLOCK_W), ce - lane_row_base);
         inline for (0..BLOCK_W) |lane| {
-            const d = dist[lane];
-            if (d < top_dists[0]) {
-                sift_in_min_i64(top_dists, top_rows, d, lane_row_base + @as(u32, @intCast(lane)));
+            if (@as(u32, @intCast(lane)) < valid_lanes) {
+                const d = dist[lane];
+                if (d < top_dists[0]) {
+                    sift_in_min_i64(top_dists, top_rows, d, lane_row_base + @as(u32, @intCast(lane)));
+                }
             }
         }
     }
