@@ -30,10 +30,11 @@
 //! Within block b of cluster c, feature k's W lanes are at offset
 //!   `(cluster_block_starts[c] + b) * N_FEATURES * W + k * W`.
 //! Lane l corresponds to canonical row `cluster_starts[c] + b * W + l`,
-//! padded to W lanes with `BLOCK_PAD_SENTINEL` (= maxInt(i16)) on the
-//! last block of each cluster. Padding lanes always lose the sift because
-//! their squared distance exceeds any real query-vs-row distance — a
-//! comptime invariant asserted in `search.zig`.
+//! padded to W lanes with `BLOCK_PAD_VALUE` (= 0) on the last block of
+//! each cluster. Padding lanes are skipped at sift time via a per-cluster
+//! valid-lane mask in `search.scan_cluster_blocks`, so the padding value
+//! itself doesn't affect correctness — 0 is chosen to keep the inner i16
+//! subtraction safely in range without forcing an i32 widen-before-sub.
 //!
 //! Quantization: `i16 = round(f * FIX_SCALE)`. Decoding back to float is
 //! `f ≈ i16 / FIX_SCALE` but the hot path never decodes — search compares
@@ -75,13 +76,17 @@ pub const K_CLUSTERS: u32 = 1024;
 /// and #4 joojf submissions. Block bytes = N_FEATURES * BLOCK_W * 2 = 224 B.
 pub const BLOCK_W: usize = 8;
 
-/// Sentinel written into padding lanes of the last block of each cluster
-/// (when row count isn't a multiple of BLOCK_W). Chosen so the squared
-/// distance produced by any query against the sentinel exceeds any real
-/// query-vs-row squared distance — proven by a comptime assertion in
-/// `search.zig`. Lets the inner loop sift branchlessly over W lanes
-/// without per-block valid-lane masking.
-pub const BLOCK_PAD_SENTINEL: i16 = std.math.maxInt(i16);
+/// Value written into padding lanes of the last block of each cluster
+/// (when row count isn't a multiple of BLOCK_W). The choice doesn't affect
+/// correctness — `search.scan_cluster_blocks` masks the sift to the
+/// per-cluster valid lane count, so padding lanes never enter top-K. Pad
+/// with 0 specifically because it stays inside the i16 subtraction range
+/// when paired with any real query feature (q ∈ [-FIX_SCALE, FIX_SCALE]),
+/// letting the inner SIMD loop keep its diff in i16 (and only widen to
+/// i32 for the square — matches the Phase 9.6 W=16 SoA pattern, ~14
+/// fewer YMM widen ops per block than a sentinel-dominates-distance
+/// approach would need).
+pub const BLOCK_PAD_VALUE: i16 = 0;
 
 /// Number of clusters scanned per query. Compile-time so `[PROBE_CLUSTERS]f32`
 /// is stack-allocated and inner loops fully unroll.
@@ -128,7 +133,7 @@ pub inline fn labels_word_count(n: u32) usize {
 }
 
 /// Number of BLOCK_W-row blocks needed to hold `rc` rows of one cluster
-/// (ceiling division — last block is right-padded with `BLOCK_PAD_SENTINEL`).
+/// (ceiling division — last block is right-padded with `BLOCK_PAD_VALUE`).
 pub inline fn block_count_for_rows(rc: u32) usize {
     return (@as(usize, rc) + BLOCK_W - 1) / BLOCK_W;
 }
@@ -531,7 +536,7 @@ pub fn write(
 
     // block_features: per cluster c, per block b ∈ [0, ceil(rc/W)), write
     // [N_FEATURES][BLOCK_W]i16 — col-major within block. Padding lanes
-    // (when rc % W != 0 on the last block) get BLOCK_PAD_SENTINEL so the
+    // (when rc % W != 0 on the last block) get BLOCK_PAD_VALUE so the
     // search-time sift comparison drops them. One block at a time fits in
     // the 224-byte stack buffer below; we stream each block as one write.
     var block_buf: [N_FEATURES * BLOCK_W]i16 = undefined;
@@ -551,7 +556,7 @@ pub fn write(
                         const clamped = @max(lo_clamp, @min(hi_clamp, q));
                         block_buf[k * BLOCK_W + lane] = @intFromFloat(clamped);
                     } else {
-                        block_buf[k * BLOCK_W + lane] = BLOCK_PAD_SENTINEL;
+                        block_buf[k * BLOCK_W + lane] = BLOCK_PAD_VALUE;
                     }
                 }
             }
@@ -703,11 +708,11 @@ test "write/load v8 round-trip with IVF metadata" {
         try std.testing.expectEqual(@as(u32, @intCast(block_count_for_rows(rc))), got);
     }
 
-    // Every stored i16 is either a real quantized value (|·| ≤ FIX_SCALE +
-    // 1) or a padding sentinel.
+    // Every stored i16 is either a real quantized value (|·| ≤ FIX_SCALE)
+    // or the padding value (0). Padding lanes are skipped at sift time.
     const max_real: i16 = @as(i16, @intCast(search.FIX_SCALE));
     for (qds.block_features) |v| {
-        try std.testing.expect(v == BLOCK_PAD_SENTINEL or (v >= -max_real and v <= max_real));
+        try std.testing.expect(v == BLOCK_PAD_VALUE or (v >= -max_real and v <= max_real));
     }
 }
 

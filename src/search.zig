@@ -58,19 +58,12 @@ const BVi16 = @Vector(BLOCK_W, i16);
 const BVi32 = @Vector(BLOCK_W, i32);
 const BVi64 = @Vector(BLOCK_W, i64);
 
-// Padding sentinel must produce a strictly larger squared distance than
-// any real per-row distance, so padding lanes always lose the sift in
-// `scan_cluster_blocks` without a per-block valid-lane mask.
-comptime {
-    const max_real_diff: i64 = 2 * @as(i64, FIX_SCALE);
-    const max_real_dist: i64 = N_FEATURES * max_real_diff * max_real_diff;
-    const sentinel: i64 = @intCast(std.math.maxInt(i16));
-    const min_pad_diff: i64 = sentinel - @as(i64, FIX_SCALE);
-    const min_pad_dist: i64 = N_FEATURES * min_pad_diff * min_pad_diff;
-    if (min_pad_dist <= max_real_dist) {
-        @compileError("BLOCK_PAD_SENTINEL no longer dominates real distances; revisit search.scan_cluster_blocks before bumping FIX_SCALE");
-    }
-}
+// Padding lanes (last block of a cluster when rc % BLOCK_W != 0) are
+// filled with `dataset_blob.BLOCK_PAD_VALUE = 0` and excluded from sift
+// via a runtime valid-lane mask in `scan_cluster_blocks`. The pad value
+// is intentionally 0 (a real quantized value) so the inner SIMD loop can
+// keep its diff in i16 — `q ∈ [-FIX_SCALE, FIX_SCALE]` minus 0 stays
+// well inside i16 range, no widen-before-sub needed.
 
 /// Quantize a 14-feature float query to i16 once per request.
 inline fn quantize_query(q: *const [N_FEATURES]f32, out: *[N_FEATURES]i16) void {
@@ -313,14 +306,11 @@ inline fn scan_cluster_blocks(
     top_dists: *[TOP_K]i64,
     top_rows: *[TOP_K]u32,
 ) void {
-    // Widen the broadcasted query to i32 once per feature: the row vector
-    // can be `BLOCK_PAD_SENTINEL` (= 32767) on padding lanes, so the diff
-    // would overflow i16 (`q - 32767` ≤ -22767, but real q can also be
-    // ±10000 → diff range ⊂ [-42767, +42767]). i32 sub stays in range.
-    var q_vec: [N_FEATURES]BVi32 = undefined;
-    inline for (0..N_FEATURES) |k| q_vec[k] = @splat(@as(i32, q_int[k]));
+    var q_vec: [N_FEATURES]BVi16 = undefined;
+    inline for (0..N_FEATURES) |k| q_vec[k] = @splat(q_int[k]);
 
     const row_base = qds.cluster_starts[c];
+    const ce: u32 = qds.cluster_starts[c + 1];
     const block_start = qds.cluster_block_starts[c];
     const block_end = qds.cluster_block_starts[c + 1];
     const stride = N_FEATURES * BLOCK_W;
@@ -332,25 +322,28 @@ inline fn scan_cluster_blocks(
             @prefetch(&qds.block_features[(b + 1) * stride], .{ .locality = 1 });
         }
 
+        // Inner loop matches Phase 9.6 W=16 SoA pattern: i16 sub (safe
+        // because pad is 0 ∈ valid range, real features ∈ [-FIX_SCALE,
+        // FIX_SCALE], diff ⊂ ±2*FIX_SCALE = ±20000 fits in i16), then
+        // widen to i32 for the square (4e8 max per feature fits in i32),
+        // then widen to i64 for the running 14-feature sum (5.6e9 fits).
         var dist: BVi64 = @splat(0);
         inline for (0..N_FEATURES) |k| {
             const r_i16: BVi16 = qds.block_features[block_base + k * BLOCK_W ..][0..BLOCK_W].*;
-            const r_i32: BVi32 = r_i16;
-            const diff_i32: BVi32 = q_vec[k] - r_i32;
+            const diff_i16: BVi16 = q_vec[k] - r_i16;
+            const diff_i32: BVi32 = diff_i16;
             const sq: BVi32 = diff_i32 * diff_i32;
             dist += @as(BVi64, sq);
         }
 
+        // Padding lanes (last block of a cluster with rc % W != 0) are
+        // pad-value rows whose row index would land outside the cluster's
+        // canonical range — sifting them in would emit garbage row indices
+        // and then `label_at()` reads the labels bitset out of bounds.
+        // Mask the sift to valid lanes only. For full blocks
+        // (valid_lanes == BLOCK_W) the comparison constant-folds; for the
+        // single partial block per cluster, ~3 wasted comparisons.
         const lane_row_base: u32 = @intCast(row_base + (b - block_start) * BLOCK_W);
-        // Mask sift to lanes within the cluster's canonical row range.
-        // Full blocks: valid_lanes == BLOCK_W (all 8 fire, predictor stays
-        // correct). Last block of a cluster with rc % W != 0: padding lanes
-        // hold sentinel features that produce huge sentinel distances —
-        // even though those distances exceed any real one, top_dists[0]
-        // starts at INT64_MAX and the very first scanned cluster would
-        // sift padding rows in with invalid row indices, then label_at()
-        // would read the labels bitset out of bounds (segfault → 500).
-        const ce: u32 = qds.cluster_starts[c + 1];
         const valid_lanes: u32 = if (lane_row_base >= ce) 0 else @min(@as(u32, BLOCK_W), ce - lane_row_base);
         inline for (0..BLOCK_W) |lane| {
             if (@as(u32, @intCast(lane)) < valid_lanes) {
@@ -705,9 +698,8 @@ test "euclidean_topk vs naive on example-references.json" {
 
 /// Test-only: build per-cluster block-SoA features + cluster_block_starts
 /// from a flat-SoA `[N_FEATURES][n]i16` source. Pads the last block of each
-/// cluster with `maxInt(i16)` (matches `dataset_blob.BLOCK_PAD_SENTINEL`).
-/// Caller pre-sizes `out_block_features` to `total_blocks * N_FEATURES *
-/// BLOCK_W` and `out_block_starts` to `[k_clusters + 1]u32`.
+/// cluster with 0 (matches `dataset_blob.BLOCK_PAD_VALUE`). Padding lanes
+/// are excluded from sift via the valid-lane mask in `scan_cluster_blocks`.
 fn build_block_features_test_only(
     n: usize,
     k_clusters: usize,
@@ -716,7 +708,6 @@ fn build_block_features_test_only(
     out_block_features: []i16,
     out_block_starts: []u32,
 ) void {
-    const sentinel: i16 = std.math.maxInt(i16);
     out_block_starts[0] = 0;
     for (0..k_clusters) |c| {
         const cs = cluster_starts[c];
@@ -730,7 +721,7 @@ fn build_block_features_test_only(
                 for (0..BLOCK_W) |lane| {
                     const row = cs + @as(u32, @intCast(b * BLOCK_W + lane));
                     out_block_features[block_base + k * BLOCK_W + lane] =
-                        if (row < ce) flat_features[k * n + row] else sentinel;
+                        if (row < ce) flat_features[k * n + row] else 0;
                 }
             }
         }
