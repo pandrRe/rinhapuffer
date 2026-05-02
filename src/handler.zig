@@ -30,6 +30,18 @@ var blob: ?dataset_blob.IvfQuantizedBlob = null;
 var q_buf: [N_FEATURES]f32 = undefined;
 var top_rows: [TOP_K]u32 = undefined;
 
+// Keep-alive policy is a comptime decision driven by the `-Dkeep-alive` build
+// option. Default off — k6 ramping load showed that honouring keep-alive head-
+// of-lines the single-threaded accept loop on idle VU connections; closing
+// per response keeps the accept queue draining. Build with
+// `zig build -Dkeep-alive=true` to flip it back on.
+const build_options = @import("build_options");
+pub const KEEP_ALIVE: bool = build_options.keep_alive;
+
+inline fn ka(req: http.Request) bool {
+    return if (KEEP_ALIVE) req.keep_alive else false;
+}
+
 /// `RESPONSES[fraud_count]` is the on-the-wire JSON body for that count.
 /// Score = `fraud_count / 5` ∈ {0.0, 0.2, 0.4, 0.6, 0.8, 1.0}; per spec
 /// `approved = score < 0.6`, so counts 0–2 are approved and 3–5 are not.
@@ -59,17 +71,17 @@ pub fn init_dataset(path: []const u8) InitError!void {
 /// Vectorize errors → 400, keep_alive preserved.
 pub fn dispatch(req: http.Request) http.Response {
     if (req.method == .get and std.mem.eql(u8, req.path, "/ready")) {
-        return .{ .status = 200, .body = "", .content_type = "text/plain", .keep_alive = req.keep_alive };
+        return .{ .status = 200, .body = "", .content_type = "text/plain", .keep_alive = ka(req) };
     }
     if (req.method == .post and std.mem.eql(u8, req.path, "/fraud-score")) {
         return handle_fraud_score(req);
     }
-    return .{ .status = 404, .body = "", .content_type = "text/plain", .keep_alive = req.keep_alive };
+    return .{ .status = 404, .body = "", .content_type = "text/plain", .keep_alive = ka(req) };
 }
 
 fn handle_fraud_score(req: http.Request) http.Response {
     payload.vectorize(req.body, &q_buf) catch {
-        return .{ .status = 400, .body = "", .content_type = "text/plain", .keep_alive = req.keep_alive };
+        return .{ .status = 400, .body = "", .content_type = "text/plain", .keep_alive = ka(req) };
     };
     const qds = blob.?.dataset;
     search.cosine_topk_q_ivf(qds, &q_buf, &top_rows);
@@ -82,7 +94,7 @@ fn handle_fraud_score(req: http.Request) http.Response {
         .status = 200,
         .body = RESPONSES[fraud_count],
         .content_type = "application/json",
-        .keep_alive = req.keep_alive,
+        .keep_alive = ka(req),
     };
 }
 
@@ -181,24 +193,29 @@ fn is_one_of_responses(body: []const u8) bool {
     return false;
 }
 
-test "dispatch — /ready" {
-    const resp = dispatch(.{ .method = .get, .path = "/ready", .body = "", .keep_alive = true });
-    try std.testing.expectEqual(@as(u16, 200), resp.status);
-    try std.testing.expectEqualStrings("", resp.body);
-    try std.testing.expect(resp.keep_alive);
+test "dispatch — /ready honours comptime keep-alive policy" {
+    const resp_ka = dispatch(.{ .method = .get, .path = "/ready", .body = "", .keep_alive = true });
+    try std.testing.expectEqual(@as(u16, 200), resp_ka.status);
+    try std.testing.expectEqualStrings("", resp_ka.body);
+    // KEEP_ALIVE off → always close. KEEP_ALIVE on → mirror the request.
+    try std.testing.expectEqual(KEEP_ALIVE, resp_ka.keep_alive);
+
+    const resp_close = dispatch(.{ .method = .get, .path = "/ready", .body = "", .keep_alive = false });
+    try std.testing.expect(!resp_close.keep_alive);
 }
 
 test "dispatch — unknown route → 404" {
     const resp = dispatch(.{ .method = .get, .path = "/nope", .body = "", .keep_alive = true });
     try std.testing.expectEqual(@as(u16, 404), resp.status);
     try std.testing.expectEqualStrings("", resp.body);
+    try std.testing.expectEqual(KEEP_ALIVE, resp.keep_alive);
 }
 
 test "dispatch — /fraud-score vectorize failure → 400" {
     const resp = dispatch(.{ .method = .post, .path = "/fraud-score", .body = "{}", .keep_alive = true });
     try std.testing.expectEqual(@as(u16, 400), resp.status);
     try std.testing.expectEqualStrings("", resp.body);
-    try std.testing.expect(resp.keep_alive);
+    try std.testing.expectEqual(KEEP_ALIVE, resp.keep_alive);
 }
 
 test "dispatch — /fraud-score on example payload[0]" {
@@ -217,7 +234,7 @@ test "dispatch — /fraud-score on example payload[0]" {
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expect(is_one_of_responses(resp.body));
     try std.testing.expectEqualStrings("application/json", resp.content_type);
-    try std.testing.expect(resp.keep_alive);
+    try std.testing.expectEqual(KEEP_ALIVE, resp.keep_alive);
 }
 
 test "dispatch — /fraud-score across all example payloads stays in spec" {

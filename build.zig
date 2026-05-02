@@ -28,6 +28,15 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
+    // Comptime-baked behaviour flags. `keep-alive` defaults off — at 900 RPS
+    // the single-threaded blocking accept loop head-of-lines on idle keep-alive
+    // connections; closing per response keeps the accept queue draining. Flip
+    // back on with `zig build -Dkeep-alive=true` if connect-per-request
+    // overhead matters more than fairness in your scenario.
+    const keep_alive = b.option(bool, "keep-alive", "Honour HTTP/1.1 keep-alive on responses (default: false)") orelse false;
+    const build_opts = b.addOptions();
+    build_opts.addOption(bool, "keep_alive", keep_alive);
+
     const mod = b.addModule("rinhapuffer", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
@@ -40,6 +49,7 @@ pub fn build(b: *std.Build) void {
         // which requires us to specify a target.
         .target = target,
     });
+    mod.addOptions("build_options", build_opts);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function

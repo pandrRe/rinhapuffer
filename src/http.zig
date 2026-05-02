@@ -17,7 +17,7 @@ const libc = std.c;
 
 pub const REQ_BUF_SIZE: usize = 8192;
 pub const HEAD_BUF_SIZE: usize = 256;
-pub const LISTEN_BACKLOG: u32 = 128;
+pub const LISTEN_BACKLOG: u32 = 1024;
 
 // Module-level static buffers. Allocated once at program load; never grow.
 // Single-threaded accept loop guarantees at most one in-flight connection,
