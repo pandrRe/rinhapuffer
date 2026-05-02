@@ -56,12 +56,35 @@ const RESPONSES = [6][]const u8{
 
 pub const InitError = dataset_blob.LoadError;
 
-/// Mmap and validate the dataset blob. Must be called once before `dispatch`.
-/// Asserts no prior dataset is loaded so a duplicate init is a loud panic, not
-/// a silent leak of the previous mmap.
+/// Mmap and validate the dataset blob, then prefault every page + best-
+/// effort `mlock`. Must be called once before `dispatch`. Asserts no prior
+/// dataset is loaded so a duplicate init is a loud panic, not a silent leak
+/// of the previous mmap.
 pub fn init_dataset(path: []const u8) InitError!void {
     std.debug.assert(blob == null);
     blob = try dataset_blob.load(path);
+    dataset_blob.prefault_and_lock(&blob.?);
+}
+
+/// Run `iters` synthetic queries through `search.euclidean_topk_q_ivf` to
+/// warm i-cache, branch predictor, and the IVF traversal code paths before
+/// the first real request lands. Cheap (~5 µs/iter). Caller must have
+/// already invoked `init_dataset`.
+pub fn warmup(iters: usize) void {
+    std.debug.assert(blob != null);
+    const ds = blob.?.dataset;
+
+    var prng = std.Random.Xoshiro256.init(0xa5a5_a5a5_a5a5_a5a5);
+    const rand = prng.random();
+    var q: [N_FEATURES]f32 = undefined;
+    var top_rows_local: [TOP_K]u32 = undefined;
+
+    var i: usize = 0;
+    while (i < iters) : (i += 1) {
+        inline for (0..N_FEATURES) |k| q[k] = rand.float(f32);
+        search.euclidean_topk_q_ivf(ds, &q, &top_rows_local);
+        std.mem.doNotOptimizeAway(top_rows_local);
+    }
 }
 
 /// Route table.

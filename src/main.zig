@@ -23,6 +23,7 @@ const SOCKET_ENV: [*:0]const u8 = "RINHAPUFFER_SOCKET";
 
 pub fn main(_: std.process.Init) !void {
     try handler.init_dataset(DATASET_PATH);
+    handler.warmup(500);
 
     const listen_fd = blk: {
         if (libc.getenv(SOCKET_ENV)) |raw| {

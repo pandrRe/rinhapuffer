@@ -40,6 +40,7 @@
 //! are LE.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const transform_reference = @import("transform_reference.zig");
 const fast_json = @import("fast_json.zig");
 const kmeans = @import("kmeans.zig");
@@ -138,6 +139,38 @@ pub inline fn label_at(bits: []const u64, row: u32) u1 {
     const word = bits[row >> 6];
     const shift: u6 = @intCast(row & 63);
     return @intCast((word >> shift) & 1);
+}
+
+/// Force every page of the mmap'd dataset to be resident before any request
+/// is served. The eval target is a Mac Mini Late 2014 (HDD); a lazy page
+/// fault on rotational disk is ~5–10 ms wall, easily creating tail spikes
+/// inside the 2 min test window. Touch one byte per 4 KB page so the kernel
+/// faults all ~20K pages once, up-front. Best-effort `mlock` on Linux pins
+/// them so they can't be evicted under cgroup memory pressure.
+///
+/// **No `madvise(MADV_RANDOM)`** — Phase 9.4 included it and regressed locally
+/// on macOS APFS (RANDOM disables readahead, which APFS uses aggressively).
+/// On Linux + HDD, omitting RANDOM keeps the kernel's default readahead
+/// behaviour during the touch loop, which is what we want.
+pub fn prefault_and_lock(blob: *const IvfQuantizedBlob) void {
+    const bytes = blob.mapped.bytes;
+    if (bytes.len == 0) return;
+
+    var sink: u8 = 0;
+    var off: usize = 0;
+    while (off < bytes.len) : (off += 4096) {
+        sink ^= bytes[off];
+    }
+    std.mem.doNotOptimizeAway(sink);
+
+    if (comptime builtin.os.tag == .linux) {
+        // mlock errors (EPERM from missing CAP_IPC_LOCK, ENOMEM from
+        // RLIMIT_MEMLOCK) are non-fatal — pages are still resident from the
+        // touch loop above. Pin only so the kernel's eviction policy
+        // doesn't reclaim them later under burst memory pressure.
+        const linux = std.os.linux;
+        _ = linux.mlock(bytes.ptr, bytes.len);
+    }
 }
 
 pub const LoadError = error{
