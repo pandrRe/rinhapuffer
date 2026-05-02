@@ -8,6 +8,7 @@ pub const payload = @import("payload.zig");
 pub const search = @import("search.zig");
 pub const dataset_blob = @import("dataset_blob.zig");
 pub const kmeans = @import("kmeans.zig");
+pub const http = @import("http.zig");
 
 test {
     _ = fast_json;
@@ -16,4 +17,5 @@ test {
     _ = search;
     _ = dataset_blob;
     _ = kmeans;
+    _ = http;
 }

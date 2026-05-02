@@ -103,12 +103,12 @@ Goal: cut the per-query scan from 3M rows to ~24k–48k by clustering and probin
 
 Goal: accept HTTP/1.1 on a TCP socket, route `/ready` and `/fraud-score`, no logic yet.
 
-- [ ] **6.1** Add `src/http.zig`. Single accept loop, blocking `read`, fixed 4 KB request buffer per connection.
-- [ ] **6.2** Parse request line + headers in place: method, path, `Content-Length`. Reject anything else with 400.
-- [ ] **6.3** Route table: `GET /ready` → 200, `POST /fraud-score` → handler stub returning `{"approved":true,"fraud_score":0.0}`.
-- [ ] **6.4** Keep-alive on by default. Response template via `writev` (status + headers + body).
-- [ ] **6.5** Integration test: spawn the server in a test, hit both endpoints with `std.http.Client`, assert responses.
-- [ ] **6.6** Commit.
+- [x] **6.1** Add `src/http.zig`. Single accept loop, blocking `read`, fixed 4 KB request buffer per connection.
+- [x] **6.2** Parse request line + headers in place: method, path, `Content-Length`. Reject anything else with 400.
+- [x] **6.3** Route table: `GET /ready` → 200, `POST /fraud-score` → handler stub returning `{"approved":true,"fraud_score":0.0}`.
+- [x] **6.4** Keep-alive on by default. Response template via `writev` (status + headers + body).
+- [x] **6.5** Integration test: spawn the server in a test, hit both endpoints with `std.http.Client`, assert responses.
+- [x] **6.6** Commit.
 
 **Exit criterion**: `curl localhost:9999/ready` → 200; `curl -X POST … /fraud-score` → stub JSON.
 
