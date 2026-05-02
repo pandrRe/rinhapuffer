@@ -154,6 +154,34 @@ fn reason(status: u16) []const u8 {
     };
 }
 
+// Hot-path 200/JSON pre-baked heads. The fraud-score handler emits exactly
+// six bodies (3 of length 35 = `{"approved":true,...}`, 3 of length 36 =
+// `{"approved":false,...}`); two keep-alive states each → four distinct
+// heads. Bypasses `format_head`'s `std.fmt.bufPrint` (~500 ns per request).
+//
+// Byte-equality with `format_head(_, .{ .status=200, .body.len=35|36,
+// .content_type="application/json", .keep_alive=true|false })` is enforced
+// by the `format_head_fast_path_byte_equality` test below.
+pub const HEAD_200_JSON_35_KA: []const u8 =
+    "HTTP/1.1 200 OK\r\nContent-Length: 35\r\nContent-Type: application/json\r\n\r\n";
+pub const HEAD_200_JSON_35_CLOSE: []const u8 =
+    "HTTP/1.1 200 OK\r\nContent-Length: 35\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+pub const HEAD_200_JSON_36_KA: []const u8 =
+    "HTTP/1.1 200 OK\r\nContent-Length: 36\r\nContent-Type: application/json\r\n\r\n";
+pub const HEAD_200_JSON_36_CLOSE: []const u8 =
+    "HTTP/1.1 200 OK\r\nContent-Length: 36\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+
+/// Pick the pre-baked head if (status, body length, content-type) match
+/// the fraud-score response shape. Returns `null` for anything that should
+/// fall through to `format_head`.
+pub fn fast_head(resp: Response) ?[]const u8 {
+    if (resp.status != 200) return null;
+    if (!std.mem.eql(u8, resp.content_type, "application/json")) return null;
+    if (resp.body.len == 35) return if (resp.keep_alive) HEAD_200_JSON_35_KA else HEAD_200_JSON_35_CLOSE;
+    if (resp.body.len == 36) return if (resp.keep_alive) HEAD_200_JSON_36_KA else HEAD_200_JSON_36_CLOSE;
+    return null;
+}
+
 /// Format the response head into `buf`. Returns the slice that was written.
 /// Pure byte function — no I/O — for unit testability.
 pub fn format_head(buf: []u8, resp: Response) error{NoSpaceLeft}![]u8 {
@@ -536,6 +564,32 @@ test "format_head — 400 close" {
         "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         head,
     );
+}
+
+test "fast_head byte-equal to format_head for 200/json/35 and /36, both keep_alive states" {
+    var buf: [HEAD_BUF_SIZE]u8 = undefined;
+    inline for ([_]usize{ 35, 36 }) |body_len| {
+        inline for ([_]bool{ true, false }) |ka| {
+            // Use a dummy body of the right length — content doesn't matter
+            // for head formatting.
+            const body = "x" ** 36;
+            const resp: Response = .{
+                .status = 200,
+                .body = body[0..body_len],
+                .content_type = "application/json",
+                .keep_alive = ka,
+            };
+            const fast = fast_head(resp).?;
+            const slow = try format_head(&buf, resp);
+            try std.testing.expectEqualStrings(slow, fast);
+        }
+    }
+}
+
+test "fast_head returns null for non-fraud-score shapes" {
+    try std.testing.expect(fast_head(.{ .status = 404, .body = "", .content_type = "text/plain", .keep_alive = false }) == null);
+    try std.testing.expect(fast_head(.{ .status = 200, .body = "", .content_type = "application/json", .keep_alive = true }) == null);
+    try std.testing.expect(fast_head(.{ .status = 200, .body = "x" ** 35, .content_type = "text/plain", .keep_alive = true }) == null);
 }
 
 test "format_head — 200 body close" {

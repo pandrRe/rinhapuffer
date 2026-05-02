@@ -40,8 +40,11 @@ const Conn = struct {
     read_buf: [READ_BUF_SIZE]u8,
     have: usize, // bytes in read_buf[0..have]
 
+    // Backing buffer for the slow `format_head` path. The hot path
+    // (200/JSON/len ∈ {35,36}) skips formatting entirely and `write_head`
+    // just aliases a static `http.HEAD_200_JSON_*` constant.
     head_buf: [HEAD_BUF_SIZE]u8,
-    head_len: usize, // bytes in head_buf[0..head_len]
+    write_head: []const u8,
 
     // Pending write description. write_off counts bytes written across the
     // head+body pair. write_body aliases a static response string (no copy).
@@ -176,14 +179,19 @@ fn accept_loop(epfd: i32, listen_fd: i32) void {
             .read_buf = undefined,
             .have = 0,
             .head_buf = undefined,
-            .head_len = 0,
+            .write_head = "",
             .write_body = "",
             .write_off = 0,
             .write_keep_alive = true,
         };
 
+        // Always-armed: register IN | OUT | ET once. ET only delivers
+        // events on transitions, so an idle conn with nothing to write
+        // never fires OUT spuriously. Removes the per-state-transition
+        // CTL_MOD that the previous code did when entering/leaving the
+        // .writing state (~2 syscalls per request saved).
         var ev: linux.epoll_event = .{
-            .events = linux.EPOLL.IN | linux.EPOLL.ET,
+            .events = linux.EPOLL.IN | linux.EPOLL.OUT | linux.EPOLL.ET,
             .data = .{ .u64 = idx },
         };
         if (@as(isize, @bitCast(linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, fd, &ev))) != 0) {
@@ -202,13 +210,15 @@ fn close_conn(epfd: i32, idx: u16) void {
     pool_free(idx);
 }
 
-fn rearm(epfd: i32, fd: i32, idx: u16, want_out: bool) void {
-    const out_bit: u32 = if (want_out) linux.EPOLL.OUT else 0;
-    var ev: linux.epoll_event = .{
-        .events = linux.EPOLL.IN | linux.EPOLL.ET | out_bit,
-        .data = .{ .u64 = idx },
-    };
-    _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &ev);
+// Always-armed EPOLLIN|EPOLLOUT|ET (set once at accept). State transitions
+// don't issue CTL_MOD anymore — the kernel only re-fires events on edge,
+// and the conn state machine ignores any flag it doesn't care about right
+// now. `rearm` kept as a no-op for callsite clarity and easy revert.
+inline fn rearm(epfd: i32, fd: i32, idx: u16, want_out: bool) void {
+    _ = epfd;
+    _ = fd;
+    _ = idx;
+    _ = want_out;
 }
 
 // ─── read + dispatch ────────────────────────────────────────────────────────
@@ -239,11 +249,18 @@ fn try_read_and_dispatch(epfd: i32, idx: u16) void {
 
             const resp = dispatch_fn(req);
 
-            const head = http.format_head(&conn.head_buf, resp) catch {
-                close_conn(epfd, idx);
-                return;
-            };
-            conn.head_len = head.len;
+            // Hot path: fraud-score 200/json responses use a precomputed
+            // head constant; everything else goes through `format_head`'s
+            // bufPrint-based slow path.
+            if (http.fast_head(resp)) |fh| {
+                conn.write_head = fh;
+            } else {
+                const head = http.format_head(&conn.head_buf, resp) catch {
+                    close_conn(epfd, idx);
+                    return;
+                };
+                conn.write_head = head;
+            }
             conn.write_body = resp.body;
             conn.write_off = 0;
             conn.write_keep_alive = resp.keep_alive;
@@ -310,7 +327,7 @@ fn advance_read(conn: *Conn, consumed: usize) void {
 // reports "couldn't drain". Caller decides.
 fn try_drain_write_inner(conn: *Conn) bool {
     while (true) {
-        const head = conn.head_buf[0..conn.head_len];
+        const head = conn.write_head;
         const total_len = head.len + conn.write_body.len;
         if (conn.write_off >= total_len) return true;
 
@@ -418,7 +435,7 @@ fn send_status_close(epfd: i32, idx: u16, status: u16) void {
         close_conn(epfd, idx);
         return;
     };
-    conn.head_len = head.len;
+    conn.write_head = head;
     conn.write_body = "";
     conn.write_off = 0;
     conn.write_keep_alive = false;

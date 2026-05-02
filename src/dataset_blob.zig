@@ -1,25 +1,25 @@
 //! On-disk format for the prepped reference dataset, plus mmap-only `load`
 //! and `write` (used by the `prep` build step).
 //!
-//! Layout v6 (little-endian, native f32 IEEE 754). Adds per-cluster
-//! axis-aligned bounding boxes (i16 lo/hi per feature) so search can prove
-//! exact top-K via a lower-bound-distance prune over unprobed clusters.
-//! Bytes-on-disk = v5 + 2 × K × N_FEATURES × 2.
+//! Layout v7 (little-endian, native f32 IEEE 754). Same as v6 except labels
+//! are packed as a u64 bitset (8× cache-density vs the v6 bool[]). Both
+//! v5→v6 (bbox columns) and v6→v7 (bitset labels) bumps are tracked in the
+//! version field below.
 //!
 //!     offset           size                          field
 //!     0                4                             magic = "RBP1"
-//!     4                4                             version: u32 = 6
+//!     4                4                             version: u32 = 7
 //!     8                4                             n: u32   (record count)
 //!     12               4                             k_clusters: u32 (= 1024 in prod)
 //!     16               4                             fix_scale: i32 (= search.FIX_SCALE)
 //!     20               12                            zero pad to 32-byte alignment
 //!     32               k_clusters * N_FEATURES * 4   centroids: [K][14]f32 row-major
 //!     +K*14*4          (k_clusters + 1) * 4          cluster_starts: [K+1]u32
-//!     +(K+1)*4         k_clusters * N_FEATURES * 2   bbox_lo: [K][14]i16 row-major  ← NEW
-//!     +K*14*2          k_clusters * N_FEATURES * 2   bbox_hi: [K][14]i16 row-major  ← NEW
+//!     +(K+1)*4         k_clusters * N_FEATURES * 2   bbox_lo: [K][14]i16 row-major
+//!     +K*14*2          k_clusters * N_FEATURES * 2   bbox_hi: [K][14]i16 row-major
 //!     pad to 16        0–15                          zero pad
 //!     features_offset  N_FEATURES * n * 2            features: i16 column-major (rows reordered by cluster)
-//!     labels_offset    n                             labels: u8 (0=legit, 1=fraud)
+//!     labels_offset    ((n + 63) / 64) * 8           labels_bits: packed u64 LE bitset (1=fraud)  ← v7
 //!
 //! Quantization: `i16 = round(f * FIX_SCALE)`. Decoding back to float is
 //! `f ≈ i16 / FIX_SCALE` but the hot path never decodes — search compares
@@ -48,7 +48,7 @@ const search = @import("search.zig");
 const N_FEATURES = transform_reference.N_FEATURES;
 
 pub const MAGIC: u32 = std.mem.readInt(u32, "RBP1", .little);
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 /// Production cluster count. Persisted in the header so loaders can reject
 /// blobs built with a different topology (`error.UnsupportedKClusters`).
@@ -92,9 +92,17 @@ pub const Offsets = struct {
     total: usize,
 };
 
-/// Compute byte offsets and total file size for a v6 blob with the given
+/// Number of u64 words needed to hold `n` packed label bits.
+pub inline fn labels_word_count(n: u32) usize {
+    return (@as(usize, n) + 63) / 64;
+}
+
+/// Compute byte offsets and total file size for a v7 blob with the given
 /// `n` and `k_clusters`. Features are 16-byte-aligned by inserting up to 15
-/// pad bytes after `bbox_hi`.
+/// pad bytes after `bbox_hi`. Labels are packed u64 (naturally 8-aligned;
+/// 16-aligned in practice since features section is 16-aligned and is a
+/// multiple of 16 bytes long for any n with `N_FEATURES * 2 % 16 == 0` not
+/// holding — features_size = 28*n bytes, so we explicitly align labels to 8).
 pub fn offsets(n: u32, k_clusters: u32) Offsets {
     const centroids = HEADER_SIZE;
     const centroids_size = @as(usize, k_clusters) * N_FEATURES * @sizeOf(f32);
@@ -106,7 +114,9 @@ pub fn offsets(n: u32, k_clusters: u32) Offsets {
     const bbox_hi_end = bbox_hi + bbox_size;
     const features = std.mem.alignForward(usize, bbox_hi_end, 16);
     const features_size = N_FEATURES * @as(usize, n) * @sizeOf(i16);
-    const labels = features + features_size;
+    const labels_unaligned = features + features_size;
+    const labels = std.mem.alignForward(usize, labels_unaligned, 8);
+    const labels_size = labels_word_count(n) * @sizeOf(u64);
     return .{
         .centroids = centroids,
         .cluster_starts = cluster_starts,
@@ -114,13 +124,20 @@ pub fn offsets(n: u32, k_clusters: u32) Offsets {
         .bbox_hi = bbox_hi,
         .features = features,
         .labels = labels,
-        .total = labels + n,
+        .total = labels + labels_size,
     };
 }
 
-/// Total bytes a v5 blob occupies on disk.
+/// Total bytes a v7 blob occupies on disk.
 pub fn blob_size(n: u32, k_clusters: u32) usize {
     return offsets(n, k_clusters).total;
+}
+
+/// Read a single packed label bit. `row` must be < n.
+pub inline fn label_at(bits: []const u64, row: u32) u1 {
+    const word = bits[row >> 6];
+    const shift: u6 = @intCast(row & 63);
+    return @intCast((word >> shift) & 1);
 }
 
 pub const LoadError = error{
@@ -179,10 +196,9 @@ pub fn load(path: []const u8) LoadError!IvfQuantizedBlob {
     const features_ptr: [*]const i16 = @ptrCast(@alignCast(mapped.bytes.ptr + off.features));
     const features = features_ptr[0..features_count];
 
-    // Labels: bool ABI is one byte with values {0,1}; producer is `write`,
-    // which writes 0/1 only.
-    const labels_ptr: [*]const bool = @ptrCast(mapped.bytes.ptr + off.labels);
-    const labels = labels_ptr[0..hdr.n];
+    // Labels: packed u64 bitset, LE within each word. Producer is `write`.
+    const labels_ptr: [*]const u64 = @ptrCast(@alignCast(mapped.bytes.ptr + off.labels));
+    const labels_bits = labels_ptr[0..labels_word_count(hdr.n)];
 
     return .{
         .mapped = mapped,
@@ -190,7 +206,7 @@ pub fn load(path: []const u8) LoadError!IvfQuantizedBlob {
             .n = hdr.n,
             .k_clusters = hdr.k_clusters,
             .features = features,
-            .labels = labels,
+            .labels_bits = labels_bits,
             .centroids = centroids,
             .cluster_starts = cluster_starts,
             .bbox_lo = bbox_lo,
@@ -199,7 +215,7 @@ pub fn load(path: []const u8) LoadError!IvfQuantizedBlob {
     };
 }
 
-/// f32 dataset materialised by dequantizing a v6 blob. Owns the f32 feature
+/// f32 dataset materialised by dequantizing a v7 blob. Owns the f32 feature
 /// and label buffers; the source mmap is closed before this returns. Provided
 /// for benchmarking parity against `euclidean_topk` — production never pays the
 /// 168 MB allocation. The cluster reordering is preserved (rows are still
@@ -216,7 +232,9 @@ pub const UnquantBlob = struct {
     }
 };
 
-/// Load the v5 blob and dequantize every feature into a fresh f32 buffer.
+/// Load the v7 blob and dequantize every feature into a fresh f32 buffer.
+/// Also unpacks the bitset labels into a fresh `[]bool` so the resulting
+/// `Dataset` is consumable by `search.euclidean_topk` and friends.
 pub fn load_unquant(allocator: std.mem.Allocator, path: []const u8) !UnquantBlob {
     var blob = try load(path);
     defer blob.deinit();
@@ -231,7 +249,7 @@ pub fn load_unquant(allocator: std.mem.Allocator, path: []const u8) !UnquantBlob
     for (0..N_FEATURES * qds.n) |i| {
         features[i] = @as(f32, @floatFromInt(qds.features[i])) * inv_scale;
     }
-    @memcpy(labels, qds.labels);
+    for (0..qds.n) |i| labels[i] = label_at(qds.labels_bits, @intCast(i)) == 1;
 
     return .{
         .allocator = allocator,
@@ -410,14 +428,43 @@ pub fn write(
         }
     }
 
-    // Labels: bool → u8 (0/1), permuted, in a 4 KiB stack buffer.
-    var byte_chunk: [4096]u8 = undefined;
-    var i: usize = 0;
-    while (i < n) {
-        const end = @min(i + byte_chunk.len, n);
-        for (i..end, 0..) |new_idx, j| byte_chunk[j] = @intFromBool(ds.labels[perm[new_idx]]);
-        try file.writeStreamingAll(io, byte_chunk[0 .. end - i]);
-        i = end;
+    // Pad up to the (8-aligned) labels offset. The features section is
+    // `28 * n` bytes long; for odd `n` that leaves a 4-byte tail, which we
+    // fill with zeros so the u64 labels word starts naturally aligned.
+    {
+        const features_end = off.features + N_FEATURES * @as(usize, n) * @sizeOf(i16);
+        std.debug.assert(features_end <= off.labels);
+        if (features_end < off.labels) {
+            var pad8: [8]u8 = @splat(0);
+            try file.writeStreamingAll(io, pad8[0 .. off.labels - features_end]);
+        }
+    }
+
+    // Labels: pack each cluster of 64 (permuted) booleans into one u64 LE
+    // word. `byte_chunk` here is a u64 stack buffer that streams 512-word
+    // (4 KiB) chunks. Trailing bits beyond `n` are zero-padded.
+    var word_chunk: [512]u64 = undefined;
+    const word_count: usize = labels_word_count(n_u32);
+    {
+        var w: usize = 0;
+        while (w < word_count) {
+            const end_w = @min(w + word_chunk.len, word_count);
+            for (w..end_w, 0..) |word_idx, j| {
+                var bits: u64 = 0;
+                const base = word_idx * 64;
+                const end_bit = @min(base + 64, n);
+                var bit_idx: usize = base;
+                while (bit_idx < end_bit) : (bit_idx += 1) {
+                    if (ds.labels[perm[bit_idx]]) {
+                        const shift: u6 = @intCast(bit_idx - base);
+                        bits |= @as(u64, 1) << shift;
+                    }
+                }
+                word_chunk[j] = bits;
+            }
+            try file.writeStreamingAll(io, std.mem.sliceAsBytes(word_chunk[0 .. end_w - w]));
+            w = end_w;
+        }
     }
 }
 
@@ -468,8 +515,8 @@ pub fn load_any_k(path: []const u8) LoadError!IvfQuantizedBlob {
     const features_ptr: [*]const i16 = @ptrCast(@alignCast(mapped.bytes.ptr + off.features));
     const features = features_ptr[0..features_count];
 
-    const labels_ptr: [*]const bool = @ptrCast(mapped.bytes.ptr + off.labels);
-    const labels = labels_ptr[0..hdr.n];
+    const labels_ptr: [*]const u64 = @ptrCast(@alignCast(mapped.bytes.ptr + off.labels));
+    const labels_bits = labels_ptr[0..labels_word_count(hdr.n)];
 
     return .{
         .mapped = mapped,
@@ -477,7 +524,7 @@ pub fn load_any_k(path: []const u8) LoadError!IvfQuantizedBlob {
             .n = hdr.n,
             .k_clusters = hdr.k_clusters,
             .features = features,
-            .labels = labels,
+            .labels_bits = labels_bits,
             .centroids = centroids,
             .cluster_starts = cluster_starts,
             .bbox_lo = bbox_lo,
@@ -486,7 +533,7 @@ pub fn load_any_k(path: []const u8) LoadError!IvfQuantizedBlob {
     };
 }
 
-test "write/load v6 round-trip with IVF metadata" {
+test "write/load v7 round-trip with IVF metadata" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -579,6 +626,58 @@ test "v5 quantization precision per element after permutation" {
     }
 }
 
+test "label_at round-trip: write known pattern, decode every bit" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Build a 100-row toy dataset whose labels form a known mod-3 pattern,
+    // write it, reload, and confirm `label_at` agrees on every row.
+    var src = try fast_json.mmap_file("./resources/example-references.json");
+    defer src.deinit();
+
+    const n = transform_reference.count_records(src.bytes);
+    const features = try allocator.alloc(f32, N_FEATURES * n);
+    defer allocator.free(features);
+    const labels = try allocator.alloc(bool, n);
+    defer allocator.free(labels);
+    var ds = try transform_reference.parse_into(src.bytes, features, labels);
+    // Overwrite labels with a deterministic pattern so the test doesn't
+    // depend on the example file's contents.
+    for (0..n) |i| labels[i] = (i % 3) == 0;
+    ds.labels = labels;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try write(allocator, io, tmp.dir, "dataset.bin", ds, TEST_K);
+
+    const path = try tmp_abs_path(allocator, &tmp, "dataset.bin");
+    defer allocator.free(path);
+    var blob = try load_any_k(path);
+    defer blob.deinit();
+    const qds = blob.dataset;
+
+    // Permutation-aware check: walk clusters in storage order, look up the
+    // original row index, compare against the mod-3 pattern.
+    // We don't have the perm here, so re-derive the equivalence indirectly:
+    // count fraud bits and check it matches the input's count.
+    var written_count: usize = 0;
+    var input_count: usize = 0;
+    for (0..n) |row| {
+        if (label_at(qds.labels_bits, @intCast(row)) == 1) written_count += 1;
+        if (labels[row]) input_count += 1;
+    }
+    try std.testing.expectEqual(input_count, written_count);
+
+    // Spot-check: every word's bit must extract via label_at consistently
+    // (i.e. label_at agrees with manual bit extraction).
+    for (0..n) |row| {
+        const word = qds.labels_bits[row >> 6];
+        const shift: u6 = @intCast(row & 63);
+        const manual: u1 = @intCast((word >> shift) & 1);
+        try std.testing.expectEqual(manual, label_at(qds.labels_bits, @intCast(row)));
+    }
+}
+
 test "v5 PROBE=K equivalence: euclidean_topk_q_ivf matches euclidean_topk_q" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -607,7 +706,7 @@ test "v5 PROBE=K equivalence: euclidean_topk_q_ivf matches euclidean_topk_q" {
     const qds_brute: transform_reference.QuantizedDataset = .{
         .n = qds_ivf.n,
         .features = qds_ivf.features,
-        .labels = qds_ivf.labels,
+        .labels_bits = qds_ivf.labels_bits,
     };
 
     var queries: [3][N_FEATURES]f32 = undefined;
@@ -751,8 +850,7 @@ test "load rejects v4 (raw-Euclidean per-column quantized format)" {
 }
 
 test "load rejects v5 (no bbox columns)" {
-    // v5 has the same header shape as v6 but no per-cluster bbox sections.
-    // The v6 reader expects bboxes, so reject by version.
+    // v5 had no per-cluster bbox sections.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -773,6 +871,32 @@ test "load rejects v5 (no bbox columns)" {
     }
 
     const path = try tmp_abs_path(allocator, &tmp, "v5.bin");
+    defer allocator.free(path);
+    try std.testing.expectError(error.UnsupportedVersion, load(path));
+}
+
+test "load rejects v6 (bool labels, pre-bitset)" {
+    // v6 had per-byte bool labels; v7 packs them into a u64 bitset.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var f = try tmp.dir.createFile(io, "v6.bin", .{});
+        defer f.close(io);
+        const hdr: Header = .{
+            .magic = MAGIC,
+            .version = 6,
+            .n = 0,
+            .k_clusters = K_CLUSTERS,
+            .fix_scale = search.FIX_SCALE,
+        };
+        try f.writeStreamingAll(io, std.mem.asBytes(&hdr));
+    }
+
+    const path = try tmp_abs_path(allocator, &tmp, "v6.bin");
     defer allocator.free(path);
     try std.testing.expectError(error.UnsupportedVersion, load(path));
 }

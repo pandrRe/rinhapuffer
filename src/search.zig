@@ -25,6 +25,11 @@ const transform_reference = @import("transform_reference.zig");
 pub const N_FEATURES: usize = transform_reference.N_FEATURES;
 pub const TOP_K: usize = 5;
 
+/// Number of clusters scanned per query in `euclidean_topk_q_ivf`. Mirrors
+/// `dataset_blob.PROBE_CLUSTERS` (which lives there for layout commentary);
+/// kept private here to avoid a circular import.
+const PROBE_CLUSTERS: usize = 8;
+
 /// Global fixed-point scale. Persisted in the v5 blob header so a stale blob
 /// built against a different value is rejected at load time.
 pub const FIX_SCALE: i32 = 10000;
@@ -145,8 +150,10 @@ pub fn euclidean_topk_q_ivf(
     q: *const [N_FEATURES]f32,
     out: *[TOP_K]u32,
 ) void {
+    @setEvalBranchQuota(8000);
     std.debug.assert(qds.n >= TOP_K);
     std.debug.assert(qds.k_clusters <= MAX_K_CLUSTERS);
+    std.debug.assert(qds.k_clusters >= PROBE_CLUSTERS);
 
     // Step 1: SIMD centroid distances (one @Vector(14, f32) per cluster).
     var centroid_dists: [MAX_K_CLUSTERS]f32 = undefined;
@@ -158,18 +165,38 @@ pub fn euclidean_topk_q_ivf(
         centroid_dists[c] = @reduce(.Add, diff * diff);
     }
 
-    // Step 2: sort cluster indices ascending by centroid distance.
-    var order: [MAX_K_CLUSTERS]u32 = undefined;
-    for (0..qds.k_clusters) |c| order[c] = @intCast(c);
-    const Ctx = struct {
-        dists: *const [MAX_K_CLUSTERS]f32,
-        fn lt(self: @This(), a: u32, b: u32) bool {
-            return self.dists[a] < self.dists[b];
+    // Step 2: select PROBE clusters with smallest centroid distance via a
+    // max-heap of size PROBE. ~10× cheaper than pdq-sorting all 1024 entries
+    // when we only need the smallest 8 in distance order. The remaining
+    // K - PROBE clusters are NOT sorted — they get walked unsorted in the
+    // bbox-prune pass, which keeps exact-top-K (every unprobed cluster that
+    // could contain a contender still gets a bbox check).
+    //
+    // `in_probe` marks the PROBE survivors so the prune pass skips them.
+    var probe_dists: [PROBE_CLUSTERS]f32 = undefined;
+    var probe_idxs: [PROBE_CLUSTERS]u32 = undefined;
+    inline for (0..PROBE_CLUSTERS) |i| {
+        probe_dists[i] = centroid_dists[i];
+        probe_idxs[i] = @intCast(i);
+    }
+    heapify_max(&probe_dists, &probe_idxs);
+    var c2: usize = PROBE_CLUSTERS;
+    while (c2 < qds.k_clusters) : (c2 += 1) {
+        if (centroid_dists[c2] < probe_dists[0]) {
+            probe_dists[0] = centroid_dists[c2];
+            probe_idxs[0] = @intCast(c2);
+            sift_down_max(&probe_dists, &probe_idxs, 0);
         }
-    };
-    std.sort.pdq(u32, order[0..qds.k_clusters], Ctx{ .dists = &centroid_dists }, Ctx.lt);
+    }
+    // PROBE is small (8) — insertion-sort the survivors ascending so the
+    // first cluster scanned is the closest (tightens `top_dists[0]` fastest).
+    sort_pairs_asc(&probe_dists, &probe_idxs);
 
-    // Step 3: ordered scan + bbox prune.
+    var in_probe = [_]bool{false} ** MAX_K_CLUSTERS;
+    inline for (0..PROBE_CLUSTERS) |i| in_probe[probe_idxs[i]] = true;
+
+    // Step 3: scan PROBE clusters in nearest-first order, then bbox-prune
+    // the remaining K - PROBE in arbitrary order. Most fail-prune cheaply.
     var q_int: [N_FEATURES]i16 = undefined;
     quantize_query(q, &q_int);
 
@@ -177,12 +204,22 @@ pub fn euclidean_topk_q_ivf(
     var top_rows: [TOP_K]u32 = @splat(0);
 
     {
-        const c = order[0];
+        const c = probe_idxs[0];
         const start = qds.cluster_starts[c];
         const end = qds.cluster_starts[c + 1];
         scan_range_int(qds.features, qds.n, start, end, &q_int, &top_dists, &top_rows);
     }
-    for (order[1..qds.k_clusters]) |c| {
+    inline for (1..PROBE_CLUSTERS) |i| {
+        const c = probe_idxs[i];
+        const lb = bbox_lower_bound_sq(&q_int, qds.bbox_lo, qds.bbox_hi, c);
+        if (lb < top_dists[0]) {
+            const start = qds.cluster_starts[c];
+            const end = qds.cluster_starts[c + 1];
+            scan_range_int(qds.features, qds.n, start, end, &q_int, &top_dists, &top_rows);
+        }
+    }
+    for (0..qds.k_clusters) |c| {
+        if (in_probe[c]) continue;
         const lb = bbox_lower_bound_sq(&q_int, qds.bbox_lo, qds.bbox_hi, c);
         if (lb >= top_dists[0]) continue;
         const start = qds.cluster_starts[c];
@@ -367,6 +404,61 @@ inline fn sift_in_min_i64(
     }
 }
 
+// ─── PROBE-cluster heap helpers ───────────────────────────────────────────
+//
+// Operate on parallel `dists` (key) + `idxs` (payload) arrays of compile-
+// time size `PROBE_CLUSTERS`. Max-heap means root = largest, so a smaller
+// candidate displaces it. After all sifting, `sort_pairs_asc` flips it
+// to ascending for the nearest-first scan order.
+
+inline fn heap_swap(dists: *[PROBE_CLUSTERS]f32, idxs: *[PROBE_CLUSTERS]u32, a: usize, b: usize) void {
+    const td = dists[a];
+    dists[a] = dists[b];
+    dists[b] = td;
+    const ti = idxs[a];
+    idxs[a] = idxs[b];
+    idxs[b] = ti;
+}
+
+inline fn sift_down_max(dists: *[PROBE_CLUSTERS]f32, idxs: *[PROBE_CLUSTERS]u32, start: usize) void {
+    var root = start;
+    while (true) {
+        const left = 2 * root + 1;
+        if (left >= PROBE_CLUSTERS) break;
+        var swap = root;
+        if (dists[swap] < dists[left]) swap = left;
+        const right = left + 1;
+        if (right < PROBE_CLUSTERS and dists[swap] < dists[right]) swap = right;
+        if (swap == root) break;
+        heap_swap(dists, idxs, root, swap);
+        root = swap;
+    }
+}
+
+inline fn heapify_max(dists: *[PROBE_CLUSTERS]f32, idxs: *[PROBE_CLUSTERS]u32) void {
+    // Floyd's bottom-up: start at last internal node, sift down. For
+    // PROBE_CLUSTERS=8 this unrolls to ~3 sifts.
+    var i: isize = @as(isize, PROBE_CLUSTERS / 2) - 1;
+    while (i >= 0) : (i -= 1) sift_down_max(dists, idxs, @intCast(i));
+}
+
+inline fn sort_pairs_asc(dists: *[PROBE_CLUSTERS]f32, idxs: *[PROBE_CLUSTERS]u32) void {
+    // Insertion sort, ascending by dist. PROBE_CLUSTERS is small (8) so
+    // this beats pdq's overhead and the branch pattern is predictable.
+    var i: usize = 1;
+    while (i < PROBE_CLUSTERS) : (i += 1) {
+        const kd = dists[i];
+        const ki = idxs[i];
+        var j: usize = i;
+        while (j > 0 and dists[j - 1] > kd) : (j -= 1) {
+            dists[j] = dists[j - 1];
+            idxs[j] = idxs[j - 1];
+        }
+        dists[j] = kd;
+        idxs[j] = ki;
+    }
+}
+
 // ─── tests ─────────────────────────────────────────────────────────────────
 
 const fast_json = @import("fast_json.zig");
@@ -544,7 +636,7 @@ test "euclidean_topk_q_ivf hand-built tiny clustered dataset" {
     const k_clusters: usize = 2;
 
     var f32_features: [N_FEATURES * n]f32 = @splat(0);
-    var labels: [n]bool = @splat(false);
+    var labels_bits: [(n + 63) / 64]u64 = @splat(0);
     for (0..5) |row| {
         f32_features[0 * n + row] = 1.0;
         f32_features[2 * n + row] = 0.001 * @as(f32, @floatFromInt(row));
@@ -571,7 +663,7 @@ test "euclidean_topk_q_ivf hand-built tiny clustered dataset" {
         .n = n,
         .k_clusters = k_clusters,
         .features = &i16_features,
-        .labels = &labels,
+        .labels_bits = &labels_bits,
         .centroids = &centroids,
         .cluster_starts = &cluster_starts,
         .bbox_lo = &bbox_lo,
@@ -589,12 +681,44 @@ test "euclidean_topk_q_ivf hand-built tiny clustered dataset" {
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4 }, &out);
 }
 
+test "heap-select helpers: smallest PROBE_CLUSTERS over a 32-element stream" {
+    // Feed 32 known distances; verify the heap-select picks the 8 smallest.
+    var src: [32]f32 = undefined;
+    for (0..32) |i| src[i] = @floatFromInt((i * 37 + 13) % 32); // shuffled 0..31
+
+    var dists: [PROBE_CLUSTERS]f32 = undefined;
+    var idxs: [PROBE_CLUSTERS]u32 = undefined;
+    inline for (0..PROBE_CLUSTERS) |i| {
+        dists[i] = src[i];
+        idxs[i] = @intCast(i);
+    }
+    heapify_max(&dists, &idxs);
+    var c: usize = PROBE_CLUSTERS;
+    while (c < src.len) : (c += 1) {
+        if (src[c] < dists[0]) {
+            dists[0] = src[c];
+            idxs[0] = @intCast(c);
+            sift_down_max(&dists, &idxs, 0);
+        }
+    }
+    sort_pairs_asc(&dists, &idxs);
+
+    // Expected smallest 8 of 0..31 are {0,1,2,3,4,5,6,7} in ascending order.
+    inline for (0..PROBE_CLUSTERS) |i| {
+        try std.testing.expectEqual(@as(f32, @floatFromInt(i)), dists[i]);
+    }
+    // Each survivor's idx must point back to a src entry whose value matches.
+    inline for (0..PROBE_CLUSTERS) |i| {
+        try std.testing.expectEqual(dists[i], src[idxs[i]]);
+    }
+}
+
 test "euclidean_topk_q hand-built tiny dataset" {
     const n: usize = 5;
     const expected_cos = [5]f32{ 1.0, 0.9, 0.5, 0.0, -1.0 };
 
     var f32_features: [N_FEATURES * n]f32 = @splat(0);
-    var labels: [n]bool = @splat(false);
+    var labels_bits: [(n + 63) / 64]u64 = @splat(0);
 
     for (expected_cos, 0..) |c, row| {
         f32_features[0 * n + row] = c;
@@ -607,7 +731,7 @@ test "euclidean_topk_q hand-built tiny dataset" {
     const qds: transform_reference.QuantizedDataset = .{
         .n = n,
         .features = &i16_features,
-        .labels = &labels,
+        .labels_bits = &labels_bits,
     };
     var q: [N_FEATURES]f32 = @splat(0);
     q[0] = 1.0;

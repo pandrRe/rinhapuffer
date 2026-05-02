@@ -88,7 +88,7 @@ fn handle_fraud_score(req: http.Request) http.Response {
 
     var fraud_count: u8 = 0;
     inline for (0..TOP_K) |i| {
-        fraud_count += @intFromBool(qds.labels[top_rows[i]]);
+        fraud_count += dataset_blob.label_at(qds.labels_bits, top_rows[i]);
     }
     return .{
         .status = 200,

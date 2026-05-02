@@ -279,7 +279,7 @@ const PerCallStats = struct {
 fn percentile(sorted: []const u64, p: f64) u64 {
     if (sorted.len == 0) return 0;
     const idx_f = p * @as(f64, @floatFromInt(sorted.len - 1));
-    const idx: usize = @intFromFloat(@round(idx_f));
+    const idx: usize = @trunc(@round(idx_f));
     return sorted[idx];
 }
 
@@ -482,7 +482,7 @@ fn brute_view(qds: transform_reference.IvfQuantizedDataset) transform_reference.
     return .{
         .n = qds.n,
         .features = qds.features,
-        .labels = qds.labels,
+        .labels_bits = qds.labels_bits,
     };
 }
 

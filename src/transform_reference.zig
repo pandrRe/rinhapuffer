@@ -28,10 +28,14 @@ pub const Dataset = struct {
 /// The hot path NEVER dequantizes — search ranks by `Σ (q_int − r_int)²` in
 /// integer space, which is `FIX_SCALE²` times the true float distance and
 /// therefore order-preserving.
+///
+/// `labels_bits` is a packed bitset of length `(n + 63) / 64` u64s, little-
+/// endian within each word. Indexed via `dataset_blob.label_at(bits, row)`.
+/// 8× tighter than `[]const bool` so the random TOP_K gather stays in L1.
 pub const QuantizedDataset = struct {
     n: usize,
     features: []const i16,
-    labels: []const bool,
+    labels_bits: []const u64,
 };
 
 /// IVF-augmented quantized SoA view: rows are reordered cluster-by-cluster
@@ -50,7 +54,9 @@ pub const IvfQuantizedDataset = struct {
     n: usize,
     k_clusters: usize,
     features: []const i16,
-    labels: []const bool,
+    /// Packed bitset of length `(n + 63) / 64` u64s, little-endian within
+    /// each word. Indexed via `dataset_blob.label_at(bits, row)`.
+    labels_bits: []const u64,
     centroids: []const f32,
     cluster_starts: []const u32,
     /// `[k_clusters * N_FEATURES]i16` — per-(cluster, feature) min, AoS by cluster.

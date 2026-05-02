@@ -68,9 +68,12 @@ const mcc_risk: [10000]f32 = blk: {
 pub fn vectorize(bytes: []const u8, out: *[N_FEATURES]f32) Error!void {
     var p = try fj.open_obj(bytes, 0);
 
-    // top-level "id" — not vectorized
-    p = try fj.enter_key(bytes, p, "id");
-    p = try fj.skip_string(bytes, p);
+    // top-level "id" — not vectorized. Schema-rigid contract guarantees it
+    // is the first key, so skip the key name entirely (no mem.eql) and the
+    // string value, then expect the trailing comma.
+    p = try fj.skip_string(bytes, fj.skip_ws(bytes, p));
+    p = try fj.expect_byte(bytes, fj.skip_ws(bytes, p), ':');
+    p = try fj.skip_string(bytes, fj.skip_ws(bytes, p));
     p = try fj.comma(bytes, p);
 
     // transaction → fills [0] amount, [1] installments, [3] hour_of_day, [4] day_of_week
