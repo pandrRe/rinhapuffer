@@ -12,11 +12,12 @@
 //! ranking is exact. The query is quantized once per request; nothing else
 //! is precomputed and nothing is dequantized per row.
 //!
-//! Strategy: W=8 rows in parallel via `@Vector(W, i16)`. Per (row chunk,
-//! feature): one i16 load, one i16 sub (no overflow at FIX_SCALE=10000), one
-//! i16 → i32 widen for the square, one i32 mul, one i32 → i64 widen + add to
-//! the accumulator. 14 features × 8 rows; tail rows handled scalar with the
-//! same algebra.
+//! Strategy: W=16 rows in parallel via `@Vector(W, i16)` (256-bit YMM under
+//! `-Dcpu=haswell`). Per (row chunk, feature): one i16 load, one i16 sub
+//! (no overflow at FIX_SCALE=10000), one i16 → i32 widen for the square,
+//! one i32 mul, one i32 → i64 widen + add to the accumulator. 14 features
+//! × 16 rows. Cluster residue handled by a W=8 chunk (XMM) and then a
+//! scalar tail with the same algebra.
 
 const std = @import("std");
 const transform_reference = @import("transform_reference.zig");
@@ -28,11 +29,18 @@ pub const TOP_K: usize = 5;
 /// built against a different value is rejected at load time.
 pub const FIX_SCALE: i32 = 10000;
 
-const W: usize = 8;
+const W: usize = 16;
 const Vec = @Vector(W, f32); // f32 brute-force only
 const Vi16 = @Vector(W, i16);
 const Vi32 = @Vector(W, i32);
 const Vi64 = @Vector(W, i64);
+
+// Half-width fallback for cluster residues in [W/2, W) — e.g. clusters of
+// 8–15 rows and the ~5-row average tail. Maps to XMM under AVX2.
+const HW: usize = W / 2;
+const HVi16 = @Vector(HW, i16);
+const HVi32 = @Vector(HW, i32);
+const HVi64 = @Vector(HW, i64);
 
 /// Stack-buffer cap. 4 KB at K=1024.
 const MAX_K_CLUSTERS: usize = 1024;
@@ -41,7 +49,8 @@ const MAX_K_CLUSTERS: usize = 1024;
 inline fn quantize_query(q: *const [N_FEATURES]f32, out: *[N_FEATURES]i16) void {
     const fix_scale_f: f32 = @floatFromInt(FIX_SCALE);
     inline for (0..N_FEATURES) |k| {
-        out[k] = @intFromFloat(@round(q[k] * fix_scale_f));
+        const r: f32 = @round(q[k] * fix_scale_f);
+        out[k] = @trunc(r);
     }
 }
 
@@ -258,7 +267,14 @@ inline fn scan_range_int(
     inline for (0..N_FEATURES) |k| q_vec[k] = @splat(q_int[k]);
 
     var row: usize = start;
+    // Prefetch ~256 B ahead in feature[0]'s column. The HW L1 streamer picks
+    // up the other 13 column streams once any byte in each is touched; issuing
+    // 14 prefetches per chunk would saturate the prefetch queue and backfire.
+    const PF_AHEAD: usize = W * 8;
     while (row + W <= end) : (row += W) {
+        if (row + PF_AHEAD < end) {
+            @prefetch(&features[row + PF_AHEAD], .{ .locality = 1 });
+        }
         var dist: Vi64 = @splat(0);
         inline for (0..N_FEATURES) |k| {
             const r_i16: Vi16 = features[k * n + row ..][0..W].*;
@@ -273,6 +289,27 @@ inline fn scan_range_int(
                 sift_in_min_i64(top_dists, top_rows, d, @intCast(row + lane));
             }
         }
+    }
+    // W/2 fallback chunk for residues in [W/2, W) — keeps clusters of 8–15
+    // rows (and average ~5-row residues after a W=16 main loop) in SIMD
+    // instead of falling all the way to the scalar tail.
+    if (row + HW <= end) {
+        var dist: HVi64 = @splat(0);
+        inline for (0..N_FEATURES) |k| {
+            const qv: HVi16 = @splat(q_int[k]);
+            const r_i16: HVi16 = features[k * n + row ..][0..HW].*;
+            const diff_i16: HVi16 = qv - r_i16;
+            const diff_i32: HVi32 = diff_i16;
+            const sq: HVi32 = diff_i32 * diff_i32;
+            dist += @as(HVi64, sq);
+        }
+        inline for (0..HW) |lane| {
+            const d = dist[lane];
+            if (d < top_dists[0]) {
+                sift_in_min_i64(top_dists, top_rows, d, @intCast(row + lane));
+            }
+        }
+        row += HW;
     }
     while (row < end) : (row += 1) {
         var dist: i64 = 0;
@@ -342,7 +379,7 @@ fn quantize_dataset(comptime n: usize, src: *const [N_FEATURES * n]f32, dst: *[N
     const hi_clamp: f32 = @floatFromInt(std.math.maxInt(i16));
     for (0..N_FEATURES * n) |i| {
         const q = @round(src[i] * fix_scale_f);
-        dst[i] = @intFromFloat(@max(lo_clamp, @min(hi_clamp, q)));
+        dst[i] = @trunc(@max(lo_clamp, @min(hi_clamp, q)));
     }
 }
 
