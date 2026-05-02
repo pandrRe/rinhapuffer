@@ -28,6 +28,27 @@ pub const Dataset = struct {
     }
 };
 
+/// Quantized SoA view over a u16-encoded dataset (the on-disk v2 format).
+///
+/// Each feature column is stored as `n` u16 values. The original f32 value is
+/// reconstructed via `f = u16 * inv_scales[k] + mins[k]`, with `mins` and
+/// `inv_scales` cached at load time from the per-feature `(min, scale)` pairs
+/// in the blob header.
+///
+/// `cosine_topk_q` consumes this view directly without materialising f32
+/// columns; only `@floatFromInt(u16) → f32` happens per row in the inner loop.
+pub const QuantizedDataset = struct {
+    n: usize,
+    features: []const u16,
+    labels: []const bool,
+    mins: [N_FEATURES]f32,
+    inv_scales: [N_FEATURES]f32,
+
+    pub fn col(self: QuantizedDataset, c: usize) []const u16 {
+        return self.features[c * self.n .. (c + 1) * self.n];
+    }
+};
+
 pub const Error = fast_json.ParseError || error{BufferTooSmall};
 
 /// Number of records in `bytes`. Use to size feature/label buffers

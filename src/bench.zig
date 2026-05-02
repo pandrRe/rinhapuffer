@@ -442,14 +442,19 @@ const SearchStats = struct {
     stddev_ns: f64,
 };
 
-/// Build `SEARCH_QUERIES` queries by sampling rows from the dataset itself
-/// and perturbing them slightly so cosine_topk can't shortcut to score=1.
-fn build_search_queries(ds: transform_reference.Dataset, queries: *[SEARCH_QUERIES][search.N_FEATURES]f32) void {
-    const stride = if (ds.n > SEARCH_QUERIES) ds.n / SEARCH_QUERIES else 1;
+/// Build `SEARCH_QUERIES` queries by sampling rows from the quantized dataset
+/// (dequantizing on the fly) and perturbing them slightly so cosine_topk_q
+/// can't shortcut to score=1.
+fn build_search_queries_q(
+    qds: transform_reference.QuantizedDataset,
+    queries: *[SEARCH_QUERIES][search.N_FEATURES]f32,
+) void {
+    const stride = if (qds.n > SEARCH_QUERIES) qds.n / SEARCH_QUERIES else 1;
     for (0..SEARCH_QUERIES) |i| {
-        const row = (i * stride) % ds.n;
+        const row = (i * stride) % qds.n;
         for (0..search.N_FEATURES) |c| {
-            const v = ds.features[c * ds.n + row];
+            const q_u16 = qds.features[c * qds.n + row];
+            const v: f32 = @as(f32, @floatFromInt(q_u16)) * qds.inv_scales[c] + qds.mins[c];
             // Tiny per-feature perturbation to defeat any "exact match" fast path.
             const jitter: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(c)) - 7)) * 0.001;
             queries[i][c] = v + jitter;
@@ -457,15 +462,15 @@ fn build_search_queries(ds: transform_reference.Dataset, queries: *[SEARCH_QUERI
     }
 }
 
-fn bench_cosine_topk(allocator: std.mem.Allocator) !SearchStats {
+fn bench_cosine_topk_q(allocator: std.mem.Allocator) !SearchStats {
     // Production-shape setup: mmap the prepped artifact, no parse, no alloc.
-    // The warm pass below faults all 168 MB of feature pages in before timing.
+    // The warm pass below faults all 84 MB of feature pages in before timing.
     var blob = try dataset_blob.load(DATASET_BIN_PATH);
     defer blob.deinit();
-    const ds = blob.dataset;
+    const qds = blob.dataset;
 
     var queries: [SEARCH_QUERIES][search.N_FEATURES]f32 = undefined;
-    build_search_queries(ds, &queries);
+    build_search_queries_q(qds, &queries);
 
     // Side-effect anchor so the optimiser keeps the call.
     var anchor: u32 = 0;
@@ -473,7 +478,7 @@ fn bench_cosine_topk(allocator: std.mem.Allocator) !SearchStats {
 
     // Warm: one full pass.
     for (&queries) |*q| {
-        search.cosine_topk(ds, q, &out);
+        search.cosine_topk_q(qds, q, &out);
         anchor +%= out[0];
     }
 
@@ -485,7 +490,7 @@ fn bench_cosine_topk(allocator: std.mem.Allocator) !SearchStats {
     for (0..SEARCH_PASSES) |_| {
         for (&queries) |*q| {
             const a = now_ns();
-            search.cosine_topk(ds, q, &out);
+            search.cosine_topk_q(qds, q, &out);
             const b = now_ns();
             samples[idx] = b - a;
             idx += 1;
@@ -508,7 +513,7 @@ fn bench_cosine_topk(allocator: std.mem.Allocator) !SearchStats {
     const stddev = @sqrt(@max(variance, 0));
 
     return .{
-        .n_rows = ds.n,
+        .n_rows = qds.n,
         .queries = SEARCH_QUERIES,
         .passes = SEARCH_PASSES,
         .min_ns = @floatFromInt(samples[0]),
@@ -704,8 +709,8 @@ pub fn main(init: std.process.Init) !void {
     const load_stats = try bench_dataset_load();
     print_load_stats("dataset_blob.load", load_stats);
 
-    std.debug.print("\n=== cosine top-K (brute force, no index) ===\n\n", .{});
+    std.debug.print("\n=== cosine top-K (quantized u16, brute force) ===\n\n", .{});
 
-    const search_stats = try bench_cosine_topk(allocator);
-    print_search_stats("search.cosine_topk", search_stats);
+    const search_stats = try bench_cosine_topk_q(allocator);
+    print_search_stats("search.cosine_topk_q", search_stats);
 }
