@@ -475,14 +475,43 @@ fn build_search_queries_q(
     }
 }
 
-/// Construct a brute-force `QuantizedDataset` view aliasing the same
-/// buffers as the IVF dataset. Used to bench the brute-force path and to
-/// compute recall@5 ground-truth.
-fn brute_view(qds: transform_reference.IvfQuantizedDataset) transform_reference.QuantizedDataset {
+/// Brute-force `QuantizedDataset` over the same data as the IVF dataset.
+/// v8 stores features in block-SoA, so we cannot alias — allocate a fresh
+/// flat-SoA buffer and dequantize-back via the unblocking walk. The buffer
+/// lives in `BruteOwned`; caller must `deinit` to free.
+const BruteOwned = struct {
+    allocator: std.mem.Allocator,
+    flat: []i16,
+    qds: transform_reference.QuantizedDataset,
+
+    fn deinit(self: *BruteOwned) void {
+        self.allocator.free(self.flat);
+    }
+};
+
+fn brute_view(allocator: std.mem.Allocator, qds: transform_reference.IvfQuantizedDataset) !BruteOwned {
+    const flat = try allocator.alloc(i16, search.N_FEATURES * qds.n);
+    errdefer allocator.free(flat);
+    for (0..qds.k_clusters) |c| {
+        const cs = qds.cluster_starts[c];
+        const ce = qds.cluster_starts[c + 1];
+        const block_start = qds.cluster_block_starts[c];
+        const blocks_in_c = qds.cluster_block_starts[c + 1] - block_start;
+        for (0..blocks_in_c) |b| {
+            const block_base = (@as(usize, block_start) + b) * search.N_FEATURES * 8;
+            for (0..8) |lane| {
+                const row = cs + @as(u32, @intCast(b * 8 + lane));
+                if (row >= ce) break;
+                for (0..search.N_FEATURES) |k| {
+                    flat[k * qds.n + row] = qds.block_features[block_base + k * 8 + lane];
+                }
+            }
+        }
+    }
     return .{
-        .n = qds.n,
-        .features = qds.features,
-        .labels_bits = qds.labels_bits,
+        .allocator = allocator,
+        .flat = flat,
+        .qds = .{ .n = qds.n, .features = flat, .labels_bits = qds.labels_bits },
     };
 }
 
@@ -554,7 +583,9 @@ fn bench_euclidean_topk_q_ivf(allocator: std.mem.Allocator, recall_out: *f64) !S
     var blob = try dataset_blob.load(DATASET_BIN_PATH);
     defer blob.deinit();
     const qds = blob.dataset;
-    const brute = brute_view(qds);
+    var brute_owned = try brute_view(allocator, qds);
+    defer brute_owned.deinit();
+    const brute = brute_owned.qds;
 
     var queries: [SEARCH_QUERIES][search.N_FEATURES]f32 = undefined;
     build_search_queries_q(qds, &queries);
@@ -636,7 +667,9 @@ fn bench_euclidean_topk_q_ivf(allocator: std.mem.Allocator, recall_out: *f64) !S
 fn bench_euclidean_topk_q_brute(allocator: std.mem.Allocator) !SearchStats {
     var blob = try dataset_blob.load(DATASET_BIN_PATH);
     defer blob.deinit();
-    const brute = brute_view(blob.dataset);
+    var brute_owned = try brute_view(allocator, blob.dataset);
+    defer brute_owned.deinit();
+    const brute = brute_owned.qds;
 
     var queries: [SEARCH_QUERIES][search.N_FEATURES]f32 = undefined;
     build_search_queries_q(blob.dataset, &queries);

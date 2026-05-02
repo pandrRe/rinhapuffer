@@ -50,6 +50,28 @@ const HVi64 = @Vector(HW, i64);
 /// Stack-buffer cap. 4 KB at K=1024.
 const MAX_K_CLUSTERS: usize = 1024;
 
+/// Block-SoA inner-loop width — must match `dataset_blob.BLOCK_W`.
+/// Mirrored here to avoid a circular import; comptime-asserted equal in
+/// `dataset_blob.zig`'s test suite (the structural round-trip).
+const BLOCK_W: usize = 8;
+const BVi16 = @Vector(BLOCK_W, i16);
+const BVi32 = @Vector(BLOCK_W, i32);
+const BVi64 = @Vector(BLOCK_W, i64);
+
+// Padding sentinel must produce a strictly larger squared distance than
+// any real per-row distance, so padding lanes always lose the sift in
+// `scan_cluster_blocks` without a per-block valid-lane mask.
+comptime {
+    const max_real_diff: i64 = 2 * @as(i64, FIX_SCALE);
+    const max_real_dist: i64 = N_FEATURES * max_real_diff * max_real_diff;
+    const sentinel: i64 = @intCast(std.math.maxInt(i16));
+    const min_pad_diff: i64 = sentinel - @as(i64, FIX_SCALE);
+    const min_pad_dist: i64 = N_FEATURES * min_pad_diff * min_pad_diff;
+    if (min_pad_dist <= max_real_dist) {
+        @compileError("BLOCK_PAD_SENTINEL no longer dominates real distances; revisit search.scan_cluster_blocks before bumping FIX_SCALE");
+    }
+}
+
 /// Quantize a 14-feature float query to i16 once per request.
 inline fn quantize_query(q: *const [N_FEATURES]f32, out: *[N_FEATURES]i16) void {
     const fix_scale_f: f32 = @floatFromInt(FIX_SCALE);
@@ -203,28 +225,19 @@ pub fn euclidean_topk_q_ivf(
     var top_dists: [TOP_K]i64 = @splat(std.math.maxInt(i64));
     var top_rows: [TOP_K]u32 = @splat(0);
 
-    {
-        const c = probe_idxs[0];
-        const start = qds.cluster_starts[c];
-        const end = qds.cluster_starts[c + 1];
-        scan_range_int(qds.features, qds.n, start, end, &q_int, &top_dists, &top_rows);
-    }
+    scan_cluster_blocks(qds, probe_idxs[0], &q_int, &top_dists, &top_rows);
     inline for (1..PROBE_CLUSTERS) |i| {
         const c = probe_idxs[i];
         const lb = bbox_lower_bound_sq(&q_int, qds.bbox_lo, qds.bbox_hi, c);
         if (lb < top_dists[0]) {
-            const start = qds.cluster_starts[c];
-            const end = qds.cluster_starts[c + 1];
-            scan_range_int(qds.features, qds.n, start, end, &q_int, &top_dists, &top_rows);
+            scan_cluster_blocks(qds, c, &q_int, &top_dists, &top_rows);
         }
     }
     for (0..qds.k_clusters) |c| {
         if (in_probe[c]) continue;
         const lb = bbox_lower_bound_sq(&q_int, qds.bbox_lo, qds.bbox_hi, c);
         if (lb >= top_dists[0]) continue;
-        const start = qds.cluster_starts[c];
-        const end = qds.cluster_starts[c + 1];
-        scan_range_int(qds.features, qds.n, start, end, &q_int, &top_dists, &top_rows);
+        scan_cluster_blocks(qds, c, &q_int, &top_dists, &top_rows);
     }
 
     inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
@@ -281,15 +294,64 @@ pub fn euclidean_topk_q_ivf_full(
     var top_rows: [TOP_K]u32 = @splat(0);
 
     for (0..qds.k_clusters) |c| {
-        const start = qds.cluster_starts[c];
-        const end = qds.cluster_starts[c + 1];
-        scan_range_int(qds.features, qds.n, start, end, &q_int, &top_dists, &top_rows);
+        scan_cluster_blocks(qds, c, &q_int, &top_dists, &top_rows);
     }
 
     inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
 }
 
-// ─── int inner loop ───────────────────────────────────────────────────────
+// ─── block-SoA cluster scan (production IVF inner loop) ──────────────────
+
+/// Scan all blocks of cluster `c`, sifting any row whose squared distance
+/// is < `top_dists[0]` into the running top-K. Padding lanes within the
+/// last block produce sentinel-large distances and are silently dropped
+/// by the sift comparison (the comptime invariant above guarantees this).
+inline fn scan_cluster_blocks(
+    qds: transform_reference.IvfQuantizedDataset,
+    c: usize,
+    q_int: *const [N_FEATURES]i16,
+    top_dists: *[TOP_K]i64,
+    top_rows: *[TOP_K]u32,
+) void {
+    // Widen the broadcasted query to i32 once per feature: the row vector
+    // can be `BLOCK_PAD_SENTINEL` (= 32767) on padding lanes, so the diff
+    // would overflow i16 (`q - 32767` ≤ -22767, but real q can also be
+    // ±10000 → diff range ⊂ [-42767, +42767]). i32 sub stays in range.
+    var q_vec: [N_FEATURES]BVi32 = undefined;
+    inline for (0..N_FEATURES) |k| q_vec[k] = @splat(@as(i32, q_int[k]));
+
+    const row_base = qds.cluster_starts[c];
+    const block_start = qds.cluster_block_starts[c];
+    const block_end = qds.cluster_block_starts[c + 1];
+    const stride = N_FEATURES * BLOCK_W;
+
+    var b: usize = block_start;
+    while (b < block_end) : (b += 1) {
+        const block_base = b * stride;
+        if (b + 1 < block_end) {
+            @prefetch(&qds.block_features[(b + 1) * stride], .{ .locality = 1 });
+        }
+
+        var dist: BVi64 = @splat(0);
+        inline for (0..N_FEATURES) |k| {
+            const r_i16: BVi16 = qds.block_features[block_base + k * BLOCK_W ..][0..BLOCK_W].*;
+            const r_i32: BVi32 = r_i16;
+            const diff_i32: BVi32 = q_vec[k] - r_i32;
+            const sq: BVi32 = diff_i32 * diff_i32;
+            dist += @as(BVi64, sq);
+        }
+
+        const lane_row_base: u32 = @intCast(row_base + (b - block_start) * BLOCK_W);
+        inline for (0..BLOCK_W) |lane| {
+            const d = dist[lane];
+            if (d < top_dists[0]) {
+                sift_in_min_i64(top_dists, top_rows, d, lane_row_base + @as(u32, @intCast(lane)));
+            }
+        }
+    }
+}
+
+// ─── int inner loop (brute-force flat-SoA path; test-only) ───────────────
 
 inline fn scan_range_int(
     features: []const i16,
@@ -629,6 +691,40 @@ test "euclidean_topk vs naive on example-references.json" {
     }
 }
 
+/// Test-only: build per-cluster block-SoA features + cluster_block_starts
+/// from a flat-SoA `[N_FEATURES][n]i16` source. Pads the last block of each
+/// cluster with `maxInt(i16)` (matches `dataset_blob.BLOCK_PAD_SENTINEL`).
+/// Caller pre-sizes `out_block_features` to `total_blocks * N_FEATURES *
+/// BLOCK_W` and `out_block_starts` to `[k_clusters + 1]u32`.
+fn build_block_features_test_only(
+    n: usize,
+    k_clusters: usize,
+    cluster_starts: []const u32,
+    flat_features: []const i16,
+    out_block_features: []i16,
+    out_block_starts: []u32,
+) void {
+    const sentinel: i16 = std.math.maxInt(i16);
+    out_block_starts[0] = 0;
+    for (0..k_clusters) |c| {
+        const cs = cluster_starts[c];
+        const ce = cluster_starts[c + 1];
+        const rc = ce - cs;
+        const blocks_in_c: u32 = @intCast((@as(usize, rc) + BLOCK_W - 1) / BLOCK_W);
+        out_block_starts[c + 1] = out_block_starts[c] + blocks_in_c;
+        for (0..blocks_in_c) |b| {
+            const block_base = (@as(usize, out_block_starts[c]) + b) * N_FEATURES * BLOCK_W;
+            for (0..N_FEATURES) |k| {
+                for (0..BLOCK_W) |lane| {
+                    const row = cs + @as(u32, @intCast(b * BLOCK_W + lane));
+                    out_block_features[block_base + k * BLOCK_W + lane] =
+                        if (row < ce) flat_features[k * n + row] else sentinel;
+                }
+            }
+        }
+    }
+}
+
 test "euclidean_topk_q_ivf hand-built tiny clustered dataset" {
     // 10 rows in 14 features. Rows 0..4 cluster around +e0, rows 5..9 around +e1.
     // K=2; query toward +e0 must return rows 0..4 (cluster 0 wins).
@@ -659,13 +755,27 @@ test "euclidean_topk_q_ivf hand-built tiny clustered dataset" {
     var bbox_hi: [k_clusters * N_FEATURES]i16 = undefined;
     compute_bboxes(n, k_clusters, &i16_features, &cluster_starts, &bbox_lo, &bbox_hi);
 
+    // Per-cluster blocks: 5 rows / W=8 = 1 block per cluster; 2 blocks total.
+    const total_blocks: usize = 2;
+    var block_features: [total_blocks * N_FEATURES * BLOCK_W]i16 = undefined;
+    var cluster_block_starts: [k_clusters + 1]u32 = undefined;
+    build_block_features_test_only(
+        n,
+        k_clusters,
+        &cluster_starts,
+        &i16_features,
+        &block_features,
+        &cluster_block_starts,
+    );
+
     const qds: transform_reference.IvfQuantizedDataset = .{
         .n = n,
         .k_clusters = k_clusters,
-        .features = &i16_features,
+        .block_features = &block_features,
         .labels_bits = &labels_bits,
         .centroids = &centroids,
         .cluster_starts = &cluster_starts,
+        .cluster_block_starts = &cluster_block_starts,
         .bbox_lo = &bbox_lo,
         .bbox_hi = &bbox_hi,
     };

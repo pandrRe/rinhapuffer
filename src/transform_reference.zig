@@ -38,14 +38,17 @@ pub const QuantizedDataset = struct {
     labels_bits: []const u64,
 };
 
-/// IVF-augmented quantized SoA view: rows are reordered cluster-by-cluster
-/// (so cluster `c` occupies `[cluster_starts[c], cluster_starts[c+1])` in
-/// every feature column), with `centroids` row-major over `[k_clusters][14]f32`
-/// (centroids stay in float for cheap PROBE selection — only ~1024 of them).
+/// IVF-augmented quantized view with **block-SoA features** (v8 layout).
+/// Rows are reordered cluster-by-cluster (cluster `c`'s canonical row range
+/// is `[cluster_starts[c], cluster_starts[c+1])`), and within each cluster
+/// the rows are stored in BLOCK_W-row blocks of `[N_FEATURES][BLOCK_W]i16`
+/// col-major-within-block. Walking a cluster's blocks is one prefetcher
+/// stream instead of 14 (vs the prior pure-SoA layout) — the layout
+/// shipped by the rinha leaderboard's #1 thiagorigonatti and #4 joojf.
 ///
 /// `bbox_lo` and `bbox_hi` are per-cluster, per-feature axis-aligned bounds in
 /// i16 quantized units. Search picks the top-N centroids by min Euclidean
-/// distance to the query, scans those clusters' row slices in int, then runs
+/// distance to the query, scans those clusters' blocks in int, then runs
 /// a **bbox repair pass** over the remaining clusters: for each, compute the
 /// axis-aligned lower-bound distance `LB² = Σ_k max(0, max(q_k − hi_k,
 /// lo_k − q_k))²`. Skip if `LB² ≥ current K-th best`; scan otherwise. The
@@ -53,12 +56,24 @@ pub const QuantizedDataset = struct {
 pub const IvfQuantizedDataset = struct {
     n: usize,
     k_clusters: usize,
-    features: []const i16,
+    /// Block-SoA features. Length = `total_blocks * N_FEATURES * BLOCK_W`.
+    /// Block b of cluster c lives at
+    ///   `[(cluster_block_starts[c] + b) * N_FEATURES * BLOCK_W ..]
+    ///    [0 .. N_FEATURES * BLOCK_W]`
+    /// Within a block, features are col-major: feature k's BLOCK_W lanes
+    /// at offset `k * BLOCK_W`. Lane l corresponds to canonical row
+    /// `cluster_starts[c] + b * BLOCK_W + l`, padded with sentinel on the
+    /// last block of each cluster when its row count isn't a multiple of W.
+    block_features: []const i16,
     /// Packed bitset of length `(n + 63) / 64` u64s, little-endian within
     /// each word. Indexed via `dataset_blob.label_at(bits, row)`.
     labels_bits: []const u64,
     centroids: []const f32,
+    /// Canonical row count per cluster (no padding). `cluster_starts[K] == n`.
     cluster_starts: []const u32,
+    /// Cumulative block count per cluster. Used to address `block_features`.
+    /// `cluster_block_starts[K]` is the total block count.
+    cluster_block_starts: []const u32,
     /// `[k_clusters * N_FEATURES]i16` — per-(cluster, feature) min, AoS by cluster.
     bbox_lo: []const i16,
     /// `[k_clusters * N_FEATURES]i16` — per-(cluster, feature) max, AoS by cluster.

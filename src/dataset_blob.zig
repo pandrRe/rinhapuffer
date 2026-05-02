@@ -1,25 +1,39 @@
 //! On-disk format for the prepped reference dataset, plus mmap-only `load`
 //! and `write` (used by the `prep` build step).
 //!
-//! Layout v7 (little-endian, native f32 IEEE 754). Same as v6 except labels
-//! are packed as a u64 bitset (8× cache-density vs the v6 bool[]). Both
-//! v5→v6 (bbox columns) and v6→v7 (bitset labels) bumps are tracked in the
-//! version field below.
+//! Layout v8 (little-endian, native f32 IEEE 754). v7→v8 reorganises the
+//! features section into per-cluster blocks of `BLOCK_W=8` rows × N_FEATURES,
+//! col-major within each block (a.k.a. block-SoA / PDX). Adds a new
+//! `cluster_block_starts[K+1]u32` section for block-range lookup. Walking
+//! a cluster's blocks is one prefetcher stream instead of 14 — top of the
+//! rinha leaderboard ships this exact shape (thiagorigonatti #1, joojf #4).
 //!
-//!     offset           size                          field
-//!     0                4                             magic = "RBP1"
-//!     4                4                             version: u32 = 7
-//!     8                4                             n: u32   (record count)
-//!     12               4                             k_clusters: u32 (= 1024 in prod)
-//!     16               4                             fix_scale: i32 (= search.FIX_SCALE)
-//!     20               12                            zero pad to 32-byte alignment
-//!     32               k_clusters * N_FEATURES * 4   centroids: [K][14]f32 row-major
-//!     +K*14*4          (k_clusters + 1) * 4          cluster_starts: [K+1]u32
-//!     +(K+1)*4         k_clusters * N_FEATURES * 2   bbox_lo: [K][14]i16 row-major
-//!     +K*14*2          k_clusters * N_FEATURES * 2   bbox_hi: [K][14]i16 row-major
-//!     pad to 16        0–15                          zero pad
-//!     features_offset  N_FEATURES * n * 2            features: i16 column-major (rows reordered by cluster)
-//!     labels_offset    ((n + 63) / 64) * 8           labels_bits: packed u64 LE bitset (1=fraud)  ← v7
+//!     offset           size                                field
+//!     0                4                                   magic = "RBP1"
+//!     4                4                                   version: u32 = 8
+//!     8                4                                   n: u32   (record count)
+//!     12               4                                   k_clusters: u32 (= 1024 in prod)
+//!     16               4                                   fix_scale: i32 (= search.FIX_SCALE)
+//!     20               12                                  zero pad to 32-byte alignment
+//!     32               k_clusters * N_FEATURES * 4         centroids: [K][14]f32 row-major
+//!     +                (k_clusters + 1) * 4                cluster_starts: [K+1]u32 (rows)
+//!     +                (k_clusters + 1) * 4                cluster_block_starts: [K+1]u32 (blocks) ← NEW
+//!     +                k_clusters * N_FEATURES * 2         bbox_lo: [K][14]i16 row-major
+//!     +                k_clusters * N_FEATURES * 2         bbox_hi: [K][14]i16 row-major
+//!     pad to 16        0–15                                zero pad
+//!     features_offset  total_blocks * N_FEATURES * W * 2   block_features: i16 block-SoA ← LAYOUT CHANGED
+//!     labels_offset    ((n + 63) / 64) * 8                 labels_bits: packed u64 LE bitset (1=fraud)
+//!
+//! Block layout: cluster c's blocks occupy
+//!   `block_features[cluster_block_starts[c] * N_FEATURES * W
+//!                .. cluster_block_starts[c+1] * N_FEATURES * W]`.
+//! Within block b of cluster c, feature k's W lanes are at offset
+//!   `(cluster_block_starts[c] + b) * N_FEATURES * W + k * W`.
+//! Lane l corresponds to canonical row `cluster_starts[c] + b * W + l`,
+//! padded to W lanes with `BLOCK_PAD_SENTINEL` (= maxInt(i16)) on the
+//! last block of each cluster. Padding lanes always lose the sift because
+//! their squared distance exceeds any real query-vs-row distance — a
+//! comptime invariant asserted in `search.zig`.
 //!
 //! Quantization: `i16 = round(f * FIX_SCALE)`. Decoding back to float is
 //! `f ≈ i16 / FIX_SCALE` but the hot path never decodes — search compares
@@ -49,11 +63,25 @@ const search = @import("search.zig");
 const N_FEATURES = transform_reference.N_FEATURES;
 
 pub const MAGIC: u32 = std.mem.readInt(u32, "RBP1", .little);
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 
 /// Production cluster count. Persisted in the header so loaders can reject
 /// blobs built with a different topology (`error.UnsupportedKClusters`).
 pub const K_CLUSTERS: u32 = 1024;
+
+/// Block width for the per-cluster block-SoA features section. 8 rows per
+/// block matches Haswell AVX2 i32 ops (one YMM `vpmulld` per feature) and
+/// matches the layout shipped by the rinha leaderboard's #1 thiagorigonatti
+/// and #4 joojf submissions. Block bytes = N_FEATURES * BLOCK_W * 2 = 224 B.
+pub const BLOCK_W: usize = 8;
+
+/// Sentinel written into padding lanes of the last block of each cluster
+/// (when row count isn't a multiple of BLOCK_W). Chosen so the squared
+/// distance produced by any query against the sentinel exceeds any real
+/// query-vs-row squared distance — proven by a comptime assertion in
+/// `search.zig`. Lets the inner loop sift branchlessly over W lanes
+/// without per-block valid-lane masking.
+pub const BLOCK_PAD_SENTINEL: i16 = std.math.maxInt(i16);
 
 /// Number of clusters scanned per query. Compile-time so `[PROBE_CLUSTERS]f32`
 /// is stack-allocated and inner loops fully unroll.
@@ -86,6 +114,7 @@ comptime {
 pub const Offsets = struct {
     centroids: usize,
     cluster_starts: usize,
+    cluster_block_starts: usize,
     bbox_lo: usize,
     bbox_hi: usize,
     features: usize,
@@ -98,40 +127,42 @@ pub inline fn labels_word_count(n: u32) usize {
     return (@as(usize, n) + 63) / 64;
 }
 
-/// Compute byte offsets and total file size for a v7 blob with the given
-/// `n` and `k_clusters`. Features are 16-byte-aligned by inserting up to 15
-/// pad bytes after `bbox_hi`. Labels are packed u64 (naturally 8-aligned;
-/// 16-aligned in practice since features section is 16-aligned and is a
-/// multiple of 16 bytes long for any n with `N_FEATURES * 2 % 16 == 0` not
-/// holding — features_size = 28*n bytes, so we explicitly align labels to 8).
-pub fn offsets(n: u32, k_clusters: u32) Offsets {
+/// Number of BLOCK_W-row blocks needed to hold `rc` rows of one cluster
+/// (ceiling division — last block is right-padded with `BLOCK_PAD_SENTINEL`).
+pub inline fn block_count_for_rows(rc: u32) usize {
+    return (@as(usize, rc) + BLOCK_W - 1) / BLOCK_W;
+}
+
+/// Compute byte offsets and total file size for a v8 blob. `total_blocks`
+/// is the sum of `block_count_for_rows(rc[c])` across all clusters — the
+/// writer computes it once after k-means assignment; the loader reads
+/// `cluster_block_starts[k_clusters]` to recover it.
+pub fn offsets(n: u32, k_clusters: u32, total_blocks: usize) Offsets {
     const centroids = HEADER_SIZE;
     const centroids_size = @as(usize, k_clusters) * N_FEATURES * @sizeOf(f32);
     const cluster_starts = centroids + centroids_size;
     const cluster_starts_end = cluster_starts + (@as(usize, k_clusters) + 1) * @sizeOf(u32);
-    const bbox_lo = cluster_starts_end;
+    const cluster_block_starts = cluster_starts_end;
+    const cluster_block_starts_end = cluster_block_starts + (@as(usize, k_clusters) + 1) * @sizeOf(u32);
+    const bbox_lo = cluster_block_starts_end;
     const bbox_size = @as(usize, k_clusters) * N_FEATURES * @sizeOf(i16);
     const bbox_hi = bbox_lo + bbox_size;
     const bbox_hi_end = bbox_hi + bbox_size;
     const features = std.mem.alignForward(usize, bbox_hi_end, 16);
-    const features_size = N_FEATURES * @as(usize, n) * @sizeOf(i16);
+    const features_size = total_blocks * N_FEATURES * BLOCK_W * @sizeOf(i16);
     const labels_unaligned = features + features_size;
     const labels = std.mem.alignForward(usize, labels_unaligned, 8);
     const labels_size = labels_word_count(n) * @sizeOf(u64);
     return .{
         .centroids = centroids,
         .cluster_starts = cluster_starts,
+        .cluster_block_starts = cluster_block_starts,
         .bbox_lo = bbox_lo,
         .bbox_hi = bbox_hi,
         .features = features,
         .labels = labels,
         .total = labels + labels_size,
     };
-}
-
-/// Total bytes a v7 blob occupies on disk.
-pub fn blob_size(n: u32, k_clusters: u32) usize {
-    return offsets(n, k_clusters).total;
 }
 
 /// Read a single packed label bit. `row` must be < n.
@@ -198,7 +229,12 @@ pub const IvfQuantizedBlob = struct {
 
 /// mmap `path`, validate the header, return an IvfQuantizedDataset view
 /// aliasing the mapping. No body parsing — the kernel faults pages in lazily
-/// on first access.
+/// on first access. Two-pass section sizing because v8's features section
+/// length depends on `total_blocks = cluster_block_starts[K]`, which lives
+/// inside the file: read the cluster_block_starts array first (using a
+/// preliminary offsets() call with total_blocks=0 to locate it), recover
+/// total_blocks from its last word, then re-call offsets() to size the
+/// rest.
 pub fn load(path: []const u8) LoadError!IvfQuantizedBlob {
     var mapped = try fast_json.mmap_file(path);
     errdefer mapped.deinit();
@@ -210,7 +246,23 @@ pub fn load(path: []const u8) LoadError!IvfQuantizedBlob {
     if (hdr.k_clusters != K_CLUSTERS) return error.UnsupportedKClusters;
     if (hdr.fix_scale != search.FIX_SCALE) return error.UnsupportedFixScale;
 
-    const off = offsets(hdr.n, hdr.k_clusters);
+    return load_inner(mapped, hdr);
+}
+
+/// Shared loader body for `load` and `load_any_k`. Assumes the header has
+/// already been validated for magic/version/fix_scale; `load` additionally
+/// requires `k_clusters == K_CLUSTERS`.
+fn load_inner(mapped: fast_json.Mapped, hdr: *const Header) LoadError!IvfQuantizedBlob {
+    // First pass: locate cluster_block_starts to recover total_blocks.
+    const off_pre = offsets(hdr.n, hdr.k_clusters, 0);
+    const cbs_end = off_pre.cluster_block_starts + (@as(usize, hdr.k_clusters) + 1) * @sizeOf(u32);
+    if (mapped.bytes.len < cbs_end) return error.Truncated;
+
+    const cbs_ptr: [*]const u32 = @ptrCast(@alignCast(mapped.bytes.ptr + off_pre.cluster_block_starts));
+    const cluster_block_starts = cbs_ptr[0 .. @as(usize, hdr.k_clusters) + 1];
+    const total_blocks: usize = cluster_block_starts[hdr.k_clusters];
+
+    const off = offsets(hdr.n, hdr.k_clusters, total_blocks);
     if (mapped.bytes.len < off.total) return error.Truncated;
 
     const centroids_ptr: [*]const f32 = @ptrCast(@alignCast(mapped.bytes.ptr + off.centroids));
@@ -225,9 +277,9 @@ pub fn load(path: []const u8) LoadError!IvfQuantizedBlob {
     const bbox_hi_ptr: [*]const i16 = @ptrCast(@alignCast(mapped.bytes.ptr + off.bbox_hi));
     const bbox_hi = bbox_hi_ptr[0..bbox_count];
 
-    const features_count = @as(usize, hdr.n) * N_FEATURES;
-    const features_ptr: [*]const i16 = @ptrCast(@alignCast(mapped.bytes.ptr + off.features));
-    const features = features_ptr[0..features_count];
+    const block_features_count = total_blocks * N_FEATURES * BLOCK_W;
+    const block_features_ptr: [*]const i16 = @ptrCast(@alignCast(mapped.bytes.ptr + off.features));
+    const block_features = block_features_ptr[0..block_features_count];
 
     // Labels: packed u64 bitset, LE within each word. Producer is `write`.
     const labels_ptr: [*]const u64 = @ptrCast(@alignCast(mapped.bytes.ptr + off.labels));
@@ -238,10 +290,11 @@ pub fn load(path: []const u8) LoadError!IvfQuantizedBlob {
         .dataset = .{
             .n = hdr.n,
             .k_clusters = hdr.k_clusters,
-            .features = features,
+            .block_features = block_features,
             .labels_bits = labels_bits,
             .centroids = centroids,
             .cluster_starts = cluster_starts,
+            .cluster_block_starts = cluster_block_starts,
             .bbox_lo = bbox_lo,
             .bbox_hi = bbox_hi,
         },
@@ -265,9 +318,11 @@ pub const UnquantBlob = struct {
     }
 };
 
-/// Load the v7 blob and dequantize every feature into a fresh f32 buffer.
-/// Also unpacks the bitset labels into a fresh `[]bool` so the resulting
+/// Load the v8 blob and dequantize every feature into a fresh **flat-SoA**
+/// f32 buffer (column-major, `features[k * n + row]`), undoing the block-SoA
+/// layout. Also unpacks the bitset labels into a fresh `[]bool`. Resulting
 /// `Dataset` is consumable by `search.euclidean_topk` and friends.
+/// Bench-only path; production never pays the 168 MB allocation.
 pub fn load_unquant(allocator: std.mem.Allocator, path: []const u8) !UnquantBlob {
     var blob = try load(path);
     defer blob.deinit();
@@ -279,8 +334,25 @@ pub fn load_unquant(allocator: std.mem.Allocator, path: []const u8) !UnquantBlob
     errdefer allocator.free(labels);
 
     const inv_scale: f32 = 1.0 / @as(f32, @floatFromInt(search.FIX_SCALE));
-    for (0..N_FEATURES * qds.n) |i| {
-        features[i] = @as(f32, @floatFromInt(qds.features[i])) * inv_scale;
+    // Walk every block, dequantize each lane into the flat-SoA buffer at
+    // its canonical row position. Padding lanes are silently dropped (they
+    // sit beyond cluster_starts[c+1]).
+    for (0..qds.k_clusters) |c| {
+        const cs = qds.cluster_starts[c];
+        const ce = qds.cluster_starts[c + 1];
+        const block_start = qds.cluster_block_starts[c];
+        const blocks_in_c = qds.cluster_block_starts[c + 1] - block_start;
+        for (0..blocks_in_c) |b| {
+            const block_base = (@as(usize, block_start) + b) * N_FEATURES * BLOCK_W;
+            for (0..BLOCK_W) |lane| {
+                const row = cs + @as(u32, @intCast(b * BLOCK_W + lane));
+                if (row >= ce) break;
+                for (0..N_FEATURES) |k| {
+                    const v = qds.block_features[block_base + k * BLOCK_W + lane];
+                    features[k * qds.n + row] = @as(f32, @floatFromInt(v)) * inv_scale;
+                }
+            }
+        }
     }
     for (0..qds.n) |i| labels[i] = label_at(qds.labels_bits, @intCast(i)) == 1;
 
@@ -297,8 +369,10 @@ pub fn load_unquant(allocator: std.mem.Allocator, path: []const u8) !UnquantBlob
 ///   1. draw a random sample, run plain Euclidean k-means → centroids
 ///   2. assign every row to its nearest centroid
 ///   3. counting-sort permutation grouping rows by cluster
-///   4. write header + centroids + cluster_starts + (i16-quantized, permuted)
-///      features + (permuted) labels
+///   4. compute per-cluster bbox over canonical (un-padded) rows
+///   5. write header + centroids + cluster_starts + cluster_block_starts +
+///      bboxes + (i16-quantized, block-SoA, sentinel-padded) block_features +
+///      bitset labels
 ///
 /// `k_clusters` is normally `K_CLUSTERS`. Tests pass smaller values to keep
 /// example datasets viable.
@@ -424,17 +498,30 @@ pub fn write(
         }
     }
 
+    // Compute cluster_block_starts: cumulative block count per cluster
+    // (each cluster ceil(rc/W) blocks). Total blocks = cluster_block_starts[K].
+    const cluster_block_starts = try allocator.alloc(u32, @as(usize, k_clusters) + 1);
+    defer allocator.free(cluster_block_starts);
+    cluster_block_starts[0] = 0;
+    for (0..k_clusters) |c| {
+        const rc: u32 = cluster_starts[c + 1] - cluster_starts[c];
+        cluster_block_starts[c + 1] = cluster_block_starts[c] + @as(u32, @intCast(block_count_for_rows(rc)));
+    }
+    const total_blocks: usize = cluster_block_starts[k_clusters];
+
     try file.writeStreamingAll(io, std.mem.asBytes(&hdr));
     try file.writeStreamingAll(io, std.mem.sliceAsBytes(centroids));
     try file.writeStreamingAll(io, std.mem.sliceAsBytes(cluster_starts));
+    try file.writeStreamingAll(io, std.mem.sliceAsBytes(cluster_block_starts));
     try file.writeStreamingAll(io, std.mem.sliceAsBytes(bbox_lo));
     try file.writeStreamingAll(io, std.mem.sliceAsBytes(bbox_hi));
 
-    // Pad to 16-align the features section.
-    const off = offsets(n_u32, k_clusters);
+    // Pad to 16-align the block_features section.
+    const off = offsets(n_u32, k_clusters, total_blocks);
     const written = HEADER_SIZE +
         centroids.len * @sizeOf(f32) +
         cluster_starts.len * @sizeOf(u32) +
+        cluster_block_starts.len * @sizeOf(u32) +
         2 * bbox_count * @sizeOf(i16);
     std.debug.assert(written <= off.features);
     if (written < off.features) {
@@ -442,30 +529,42 @@ pub fn write(
         try file.writeStreamingAll(io, pad[0 .. off.features - written]);
     }
 
-    // Features: 14 columns × n rows, i16-quantized + permuted, written
-    // column-major in 2048-row chunks (a 4 KiB stack buffer of i16).
-    var i16_chunk: [2048]i16 = undefined;
-    for (0..N_FEATURES) |k| {
-        var i: usize = 0;
-        while (i < n) {
-            const end = @min(i + i16_chunk.len, n);
-            for (i..end, 0..) |new_idx, j| {
-                const old_row = perm[new_idx];
-                const f = ds.features[k * n + old_row];
-                const q = @round(f * fix_scale_f);
-                const clamped = @max(lo_clamp, @min(hi_clamp, q));
-                i16_chunk[j] = @intFromFloat(clamped);
+    // block_features: per cluster c, per block b ∈ [0, ceil(rc/W)), write
+    // [N_FEATURES][BLOCK_W]i16 — col-major within block. Padding lanes
+    // (when rc % W != 0 on the last block) get BLOCK_PAD_SENTINEL so the
+    // search-time sift comparison drops them. One block at a time fits in
+    // the 224-byte stack buffer below; we stream each block as one write.
+    var block_buf: [N_FEATURES * BLOCK_W]i16 = undefined;
+    for (0..k_clusters) |c| {
+        const cs = cluster_starts[c];
+        const ce = cluster_starts[c + 1];
+        const blocks_in_c = block_count_for_rows(ce - cs);
+        for (0..blocks_in_c) |b| {
+            const row_base = cs + @as(u32, @intCast(b * BLOCK_W));
+            inline for (0..N_FEATURES) |k| {
+                inline for (0..BLOCK_W) |lane| {
+                    const new_idx = row_base + @as(u32, @intCast(lane));
+                    if (new_idx < ce) {
+                        const old_row = perm[new_idx];
+                        const f = ds.features[k * n + old_row];
+                        const q = @round(f * fix_scale_f);
+                        const clamped = @max(lo_clamp, @min(hi_clamp, q));
+                        block_buf[k * BLOCK_W + lane] = @intFromFloat(clamped);
+                    } else {
+                        block_buf[k * BLOCK_W + lane] = BLOCK_PAD_SENTINEL;
+                    }
+                }
             }
-            try file.writeStreamingAll(io, std.mem.sliceAsBytes(i16_chunk[0 .. end - i]));
-            i = end;
+            try file.writeStreamingAll(io, std.mem.sliceAsBytes(block_buf[0..]));
         }
     }
 
-    // Pad up to the (8-aligned) labels offset. The features section is
-    // `28 * n` bytes long; for odd `n` that leaves a 4-byte tail, which we
-    // fill with zeros so the u64 labels word starts naturally aligned.
+    // Pad up to the (8-aligned) labels offset. Each block is `N_FEATURES *
+    // BLOCK_W * 2` = 224 bytes; for total_blocks * 224, the modulo-8
+    // remainder is 0 (224 = 28 * 8). So the pad is always 0 in practice,
+    // but we keep the alignment forward in case BLOCK_W changes.
     {
-        const features_end = off.features + N_FEATURES * @as(usize, n) * @sizeOf(i16);
+        const features_end = off.features + total_blocks * N_FEATURES * BLOCK_W * @sizeOf(i16);
         std.debug.assert(features_end <= off.labels);
         if (features_end < off.labels) {
             var pad8: [8]u8 = @splat(0);
@@ -529,44 +628,38 @@ pub fn load_any_k(path: []const u8) LoadError!IvfQuantizedBlob {
     if (hdr.version != VERSION) return error.UnsupportedVersion;
     if (hdr.fix_scale != search.FIX_SCALE) return error.UnsupportedFixScale;
 
-    const off = offsets(hdr.n, hdr.k_clusters);
-    if (mapped.bytes.len < off.total) return error.Truncated;
-
-    const centroids_ptr: [*]const f32 = @ptrCast(@alignCast(mapped.bytes.ptr + off.centroids));
-    const centroids = centroids_ptr[0 .. @as(usize, hdr.k_clusters) * N_FEATURES];
-
-    const starts_ptr: [*]const u32 = @ptrCast(@alignCast(mapped.bytes.ptr + off.cluster_starts));
-    const cluster_starts = starts_ptr[0 .. @as(usize, hdr.k_clusters) + 1];
-
-    const bbox_count = @as(usize, hdr.k_clusters) * N_FEATURES;
-    const bbox_lo_ptr: [*]const i16 = @ptrCast(@alignCast(mapped.bytes.ptr + off.bbox_lo));
-    const bbox_lo = bbox_lo_ptr[0..bbox_count];
-    const bbox_hi_ptr: [*]const i16 = @ptrCast(@alignCast(mapped.bytes.ptr + off.bbox_hi));
-    const bbox_hi = bbox_hi_ptr[0..bbox_count];
-
-    const features_count = @as(usize, hdr.n) * N_FEATURES;
-    const features_ptr: [*]const i16 = @ptrCast(@alignCast(mapped.bytes.ptr + off.features));
-    const features = features_ptr[0..features_count];
-
-    const labels_ptr: [*]const u64 = @ptrCast(@alignCast(mapped.bytes.ptr + off.labels));
-    const labels_bits = labels_ptr[0..labels_word_count(hdr.n)];
-
-    return .{
-        .mapped = mapped,
-        .dataset = .{
-            .n = hdr.n,
-            .k_clusters = hdr.k_clusters,
-            .features = features,
-            .labels_bits = labels_bits,
-            .centroids = centroids,
-            .cluster_starts = cluster_starts,
-            .bbox_lo = bbox_lo,
-            .bbox_hi = bbox_hi,
-        },
-    };
+    return load_inner(mapped, hdr);
 }
 
-test "write/load v7 round-trip with IVF metadata" {
+/// Test-only: dequantize a block-SoA IvfQuantizedDataset back to a flat
+/// canonical-ordered i16 SoA buffer (`[N_FEATURES][n]i16`, k * n + row
+/// addressing). Used by tests that need to compare against the brute-force
+/// flat-SoA path (`search.euclidean_topk_q`). Caller frees.
+fn flatten_block_features_test_only(
+    allocator: std.mem.Allocator,
+    qds: transform_reference.IvfQuantizedDataset,
+) ![]i16 {
+    const out = try allocator.alloc(i16, N_FEATURES * qds.n);
+    for (0..qds.k_clusters) |c| {
+        const cs = qds.cluster_starts[c];
+        const ce = qds.cluster_starts[c + 1];
+        const block_start = qds.cluster_block_starts[c];
+        const blocks_in_c = qds.cluster_block_starts[c + 1] - block_start;
+        for (0..blocks_in_c) |b| {
+            const block_base = (@as(usize, block_start) + b) * N_FEATURES * BLOCK_W;
+            for (0..BLOCK_W) |lane| {
+                const row = cs + @as(u32, @intCast(b * BLOCK_W + lane));
+                if (row >= ce) break;
+                for (0..N_FEATURES) |k| {
+                    out[k * qds.n + row] = qds.block_features[block_base + k * BLOCK_W + lane];
+                }
+            }
+        }
+    }
+    return out;
+}
+
+test "write/load v8 round-trip with IVF metadata" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -601,14 +694,20 @@ test "write/load v7 round-trip with IVF metadata" {
         try std.testing.expect(qds.cluster_starts[c] >= qds.cluster_starts[c - 1]);
     }
 
-    // Sanity-check quantization: every stored i16 should round-trip back to
-    // a value within one quant step (1/FIX_SCALE) of *some* original feature
-    // value in the same column.
-    const inv_scale: f32 = 1.0 / @as(f32, @floatFromInt(search.FIX_SCALE));
-    for (0..N_FEATURES * n) |i| {
-        const dequant = @as(f32, @floatFromInt(qds.features[i])) * inv_scale;
-        // Bounded by quantization step.
-        try std.testing.expect(@abs(dequant) <= 1.0 + inv_scale);
+    // cluster_block_starts: monotonic; per-cluster block count matches
+    // ceil(rc / BLOCK_W).
+    try std.testing.expectEqual(@as(u32, 0), qds.cluster_block_starts[0]);
+    for (0..@as(usize, TEST_K)) |c| {
+        const rc = qds.cluster_starts[c + 1] - qds.cluster_starts[c];
+        const got = qds.cluster_block_starts[c + 1] - qds.cluster_block_starts[c];
+        try std.testing.expectEqual(@as(u32, @intCast(block_count_for_rows(rc))), got);
+    }
+
+    // Every stored i16 is either a real quantized value (|·| ≤ FIX_SCALE +
+    // 1) or a padding sentinel.
+    const max_real: i16 = @as(i16, @intCast(search.FIX_SCALE));
+    for (qds.block_features) |v| {
+        try std.testing.expect(v == BLOCK_PAD_SENTINEL or (v >= -max_real and v <= max_real));
     }
 }
 
@@ -636,6 +735,10 @@ test "v5 quantization precision per element after permutation" {
     defer blob.deinit();
     const qds = blob.dataset;
 
+    // Block-SoA → flat-SoA i16 buffer for the per-column comparison below.
+    const flat = try flatten_block_features_test_only(allocator, qds);
+    defer allocator.free(flat);
+
     // Per-column sorted comparison, matching values in order. The global
     // FIX_SCALE means quant step is 1/FIX_SCALE for every column.
     const inv_scale: f32 = 1.0 / @as(f32, @floatFromInt(search.FIX_SCALE));
@@ -649,7 +752,7 @@ test "v5 quantization precision per element after permutation" {
     for (0..N_FEATURES) |k| {
         for (0..n) |row| orig_col[row] = ds.features[k * n + row];
         for (0..n) |row| {
-            blob_col[row] = @as(f32, @floatFromInt(qds.features[k * n + row])) * inv_scale;
+            blob_col[row] = @as(f32, @floatFromInt(flat[k * n + row])) * inv_scale;
         }
         std.mem.sort(f32, orig_col, {}, std.sort.asc(f32));
         std.mem.sort(f32, blob_col, {}, std.sort.asc(f32));
@@ -735,10 +838,13 @@ test "v5 PROBE=K equivalence: euclidean_topk_q_ivf matches euclidean_topk_q" {
     defer blob.deinit();
     const qds_ivf = blob.dataset;
 
-    // Build a brute-force quantized view aliasing the same buffers.
+    // Build a flat-SoA i16 buffer for the brute-force baseline. Cannot
+    // alias the IVF block-SoA buffer (different layout); allocate fresh.
+    const flat = try flatten_block_features_test_only(std.testing.allocator, qds_ivf);
+    defer std.testing.allocator.free(flat);
     const qds_brute: transform_reference.QuantizedDataset = .{
         .n = qds_ivf.n,
-        .features = qds_ivf.features,
+        .features = flat,
         .labels_bits = qds_ivf.labels_bits,
     };
 
@@ -909,7 +1015,6 @@ test "load rejects v5 (no bbox columns)" {
 }
 
 test "load rejects v6 (bool labels, pre-bitset)" {
-    // v6 had per-byte bool labels; v7 packs them into a u64 bitset.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -930,6 +1035,33 @@ test "load rejects v6 (bool labels, pre-bitset)" {
     }
 
     const path = try tmp_abs_path(allocator, &tmp, "v6.bin");
+    defer allocator.free(path);
+    try std.testing.expectError(error.UnsupportedVersion, load(path));
+}
+
+test "load rejects v7 (flat-SoA features, pre-block-SoA)" {
+    // v7 stored features as flat column-major SoA; v8 reorganises into
+    // per-cluster blocks of BLOCK_W rows × N_FEATURES.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var f = try tmp.dir.createFile(io, "v7.bin", .{});
+        defer f.close(io);
+        const hdr: Header = .{
+            .magic = MAGIC,
+            .version = 7,
+            .n = 0,
+            .k_clusters = K_CLUSTERS,
+            .fix_scale = search.FIX_SCALE,
+        };
+        try f.writeStreamingAll(io, std.mem.asBytes(&hdr));
+    }
+
+    const path = try tmp_abs_path(allocator, &tmp, "v7.bin");
     defer allocator.free(path);
     try std.testing.expectError(error.UnsupportedVersion, load(path));
 }

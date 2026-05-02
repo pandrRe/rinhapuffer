@@ -34,12 +34,18 @@ pub fn main(init: std.process.Init) !void {
         rinhapuffer.dataset_blob.K_CLUSTERS,
     );
 
+    const written = blk: {
+        var f = try cwd.openFile(init.io, OUTPUT_SUB_PATH, .{});
+        defer f.close(init.io);
+        const st = try f.stat(init.io);
+        break :blk st.size;
+    };
     std.debug.print(
         "wrote {s}: {d} records, {d} bytes (K={d} clusters)\n",
         .{
             OUTPUT_SUB_PATH,
             ds.n,
-            rinhapuffer.dataset_blob.blob_size(@intCast(ds.n), rinhapuffer.dataset_blob.K_CLUSTERS),
+            written,
             rinhapuffer.dataset_blob.K_CLUSTERS,
         },
     );
