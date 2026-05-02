@@ -148,6 +148,19 @@ Goal: eliminate the 298/299 FP+FN caused by dataset L2-normalization (diagnosed 
 
 ---
 
+## Phase 7.6 — Int-only Euclidean hot path (i16 + global FIX_SCALE, v5 blob)
+
+Goal: drop dequantization from the row scan loop entirely, following the pattern from [thiagorigonatti/rinha-2026](https://github.com/thiagorigonatti/rinha-2026). One global `FIX_SCALE` constant replaces the per-column `(min, scale)` table; ranking happens in integer units (`Σ (q_i - r_i)²`); the per-query precompute (`QueryPlan`) collapses to one 14-element quantize.
+
+- [x] **7.6.1** `search.FIX_SCALE = 10000`. Storage `u16 → i16`. Drop `mins`/`inv_scales` from `QuantizedDataset`/`IvfQuantizedDataset`. Drop `QuantParam`/`compute_quant_params` from `dataset_blob`.
+- [x] **7.6.2** Bump `dataset_blob.VERSION` 4 → 5. Header shrinks 128 → 32 bytes (only `magic, version, n, k_clusters, fix_scale, [3]u32 pad`). Add `error.UnsupportedFixScale`. Add `load rejects v4` and `load rejects mismatched fix_scale` tests.
+- [x] **7.6.3** Rewrite `search.zig` with int hot path: i16 load → i16 sub → i32 widen → i32 mul → i64 widen + accumulate. Centroid PROBE selection stays in float.
+- [x] **7.6.4** Re-prep, smoke, diagnose, k6.
+
+**Result**: errors **8 → 7** (FP=5, FN=2). k6 final score **5,647.17 → 5,676.25**. **p99 0.91 ms → 0.62 ms (−32%)** — int hot path is faster on Apple Silicon despite extra widens, because no fp/int register-bridge and 3 ops/feature vs 4. 0 HTTP errors. Net `-131` lines of code.
+
+---
+
 ## Phase 8 — Containerize against the rinha spec
 
 Goal: hand a docker image that the rinha harness can run.
