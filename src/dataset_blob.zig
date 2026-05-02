@@ -134,6 +134,54 @@ pub fn load(path: []const u8) LoadError!QuantizedBlob {
     };
 }
 
+/// f32 dataset materialised by dequantizing a v2 blob. Owns the f32 feature
+/// and label buffers; the source mmap is closed before this returns.
+/// Provided for benchmarking parity against `cosine_topk` — production never
+/// pays the 168 MB allocation.
+pub const UnquantBlob = struct {
+    allocator: std.mem.Allocator,
+    features: []f32,
+    labels: []bool,
+    dataset: transform_reference.Dataset,
+
+    pub fn deinit(self: *UnquantBlob) void {
+        self.allocator.free(self.features);
+        self.allocator.free(self.labels);
+    }
+};
+
+/// Load the v2 blob and dequantize every feature into a fresh f32 buffer.
+/// Allocates `N_FEATURES * n * 4` + `n` bytes (~171 MB at full size). Used by
+/// the bench harness to pit `cosine_topk` (f32) against `cosine_topk_q` (u16)
+/// over the same on-disk dataset.
+pub fn load_unquant(allocator: std.mem.Allocator, path: []const u8) !UnquantBlob {
+    var blob = try load(path);
+    defer blob.deinit();
+    const qds = blob.dataset;
+
+    const features = try allocator.alloc(f32, N_FEATURES * qds.n);
+    errdefer allocator.free(features);
+    const labels = try allocator.alloc(bool, qds.n);
+    errdefer allocator.free(labels);
+
+    for (0..N_FEATURES) |k| {
+        const inv_scale = qds.inv_scales[k];
+        const min = qds.mins[k];
+        for (0..qds.n) |row| {
+            const u = qds.features[k * qds.n + row];
+            features[k * qds.n + row] = @as(f32, @floatFromInt(u)) * inv_scale + min;
+        }
+    }
+    @memcpy(labels, qds.labels);
+
+    return .{
+        .allocator = allocator,
+        .features = features,
+        .labels = labels,
+        .dataset = .{ .n = qds.n, .features = features, .labels = labels },
+    };
+}
+
 /// Serialize a Dataset to `<dir>/<sub_path>`, truncating an existing file.
 /// Quantizes per-column to u16 against `(min, scale)` derived from the input.
 /// Used by the `prep` build step.

@@ -442,6 +442,23 @@ const SearchStats = struct {
     stddev_ns: f64,
 };
 
+/// f32 query builder for `bench_cosine_topk_f32`. Mirrors `build_search_queries_q`
+/// but reads f32 features directly.
+fn build_search_queries_f32(
+    ds: transform_reference.Dataset,
+    queries: *[SEARCH_QUERIES][search.N_FEATURES]f32,
+) void {
+    const stride = if (ds.n > SEARCH_QUERIES) ds.n / SEARCH_QUERIES else 1;
+    for (0..SEARCH_QUERIES) |i| {
+        const row = (i * stride) % ds.n;
+        for (0..search.N_FEATURES) |c| {
+            const v = ds.features[c * ds.n + row];
+            const jitter: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(c)) - 7)) * 0.001;
+            queries[i][c] = v + jitter;
+        }
+    }
+}
+
 /// Build `SEARCH_QUERIES` queries by sampling rows from the quantized dataset
 /// (dequantizing on the fly) and perturbing them slightly so cosine_topk_q
 /// can't shortcut to score=1.
@@ -460,6 +477,68 @@ fn build_search_queries_q(
             queries[i][c] = v + jitter;
         }
     }
+}
+
+fn bench_cosine_topk_f32(allocator: std.mem.Allocator) !SearchStats {
+    // Dequantize the v2 blob into a 168 MB f32 buffer so we can bench the
+    // unquantized inner loop against the quantized one over the same data.
+    var blob = try dataset_blob.load_unquant(allocator, DATASET_BIN_PATH);
+    defer blob.deinit();
+    const ds = blob.dataset;
+
+    var queries: [SEARCH_QUERIES][search.N_FEATURES]f32 = undefined;
+    build_search_queries_f32(ds, &queries);
+
+    var anchor: u32 = 0;
+    var out: [search.TOP_K]u32 = undefined;
+
+    for (&queries) |*q| {
+        search.cosine_topk(ds, q, &out);
+        anchor +%= out[0];
+    }
+
+    const total_calls = SEARCH_PASSES * SEARCH_QUERIES;
+    const samples = try allocator.alloc(u64, total_calls);
+    defer allocator.free(samples);
+
+    var idx: usize = 0;
+    for (0..SEARCH_PASSES) |_| {
+        for (&queries) |*q| {
+            const a = now_ns();
+            search.cosine_topk(ds, q, &out);
+            const b = now_ns();
+            samples[idx] = b - a;
+            idx += 1;
+            anchor +%= out[0];
+        }
+    }
+    std.mem.doNotOptimizeAway(anchor);
+
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+
+    var sum: u128 = 0;
+    var sum_sq: u128 = 0;
+    for (samples) |x| {
+        sum += x;
+        sum_sq += @as(u128, x) * @as(u128, x);
+    }
+    const n_f = @as(f64, @floatFromInt(samples.len));
+    const mean = @as(f64, @floatFromInt(sum)) / n_f;
+    const variance = @as(f64, @floatFromInt(sum_sq)) / n_f - mean * mean;
+    const stddev = @sqrt(@max(variance, 0));
+
+    return .{
+        .n_rows = ds.n,
+        .queries = SEARCH_QUERIES,
+        .passes = SEARCH_PASSES,
+        .min_ns = @floatFromInt(samples[0]),
+        .p50_ns = @floatFromInt(percentile(samples, 0.50)),
+        .p95_ns = @floatFromInt(percentile(samples, 0.95)),
+        .p99_ns = @floatFromInt(percentile(samples, 0.99)),
+        .max_ns = @floatFromInt(samples[samples.len - 1]),
+        .mean_ns = mean,
+        .stddev_ns = stddev,
+    };
 }
 
 fn bench_cosine_topk_q(allocator: std.mem.Allocator) !SearchStats {
@@ -711,6 +790,11 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("\n=== cosine top-K (quantized u16, brute force) ===\n\n", .{});
 
-    const search_stats = try bench_cosine_topk_q(allocator);
-    print_search_stats("search.cosine_topk_q", search_stats);
+    const search_stats_q = try bench_cosine_topk_q(allocator);
+    print_search_stats("search.cosine_topk_q", search_stats_q);
+
+    std.debug.print("\n=== cosine top-K (unquantized f32, brute force) ===\n\n", .{});
+
+    const search_stats_f32 = try bench_cosine_topk_f32(allocator);
+    print_search_stats("search.cosine_topk", search_stats_f32);
 }
