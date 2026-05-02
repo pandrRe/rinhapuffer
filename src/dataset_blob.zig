@@ -405,10 +405,11 @@ fn tmp_abs_path(
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_buf[0..dir_len], sub_path });
 }
 
-/// Test-only loader: same as `load` but accepts any `k_clusters`. Used to
-/// load fixture files written with `TEST_K` in the round-trip + equivalence
-/// tests; production `load` enforces `K_CLUSTERS`.
-fn load_any_k(path: []const u8) LoadError!IvfQuantizedBlob {
+/// Test-only loader: same as `load` but accepts any `k_clusters`. Used by
+/// fixture files written with smaller `K` values (TEST_K=4 from `example-
+/// references.json`) that the production `load` would reject. Only callers
+/// in tests should reach for this; production paths must use `load`.
+pub fn load_any_k(path: []const u8) LoadError!IvfQuantizedBlob {
     var mapped = try fast_json.mmap_file(path);
     errdefer mapped.deinit();
 
