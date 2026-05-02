@@ -60,7 +60,19 @@ echo "==> build rinhapuffer for ${ZIG_TARGET}"
 # many persistent conns concurrently — HoL on idle keep-alive is no longer
 # a concern. Mac native build keeps the blocking accept loop and defaults
 # `-Dkeep-alive=false` (per `build.zig`).
-zig build -Doptimize=ReleaseFast -Dtarget="${ZIG_TARGET}" -Dkeep-alive=true
+#
+# `-Dcpu=haswell` (Phase 9.3, amd64 only): the rinha eval runs on a Mac
+# Mini Late 2014 (Haswell — i5-4260U / i7-4770HQ — see
+# rinha-de-backend-2026/docs/br/SUBMISSAO.md). Default x86_64 baseline is
+# SSE2-only and `@Vector(N_FEATURES, ...)` paths emit 2× XMM instead of
+# one YMM. Targeting Haswell unlocks AVX2 (256-bit YMM) + FMA3 + BMI2
+# for `bbox_lower_bound_sq` and the centroid-distance scan. arm64 build
+# stays on its native CPU since `-Dcpu=haswell` is x86-specific.
+CPU_FLAG=""
+if [ "$TARGET_ARCH" = "amd64" ]; then
+    CPU_FLAG="-Dcpu=haswell"
+fi
+zig build -Doptimize=ReleaseFast -Dtarget="${ZIG_TARGET}" -Dkeep-alive=true ${CPU_FLAG}
 
 echo
 echo "==> artifacts"
