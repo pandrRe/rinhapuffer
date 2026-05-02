@@ -161,6 +161,19 @@ Goal: drop dequantization from the row scan loop entirely, following the pattern
 
 ---
 
+## Phase 7.7 — Bbox repair pass for exact top-K (v6 blob)
+
+Goal: 100% accuracy via correctness-by-construction. Per-cluster axis-aligned `[lo, hi]` i16 bboxes give an exact lower-bound distance from query to any point in the cluster; skip clusters that can't beat the current K-th best.
+
+- [x] **7.7.1** Add `bbox_lo`, `bbox_hi: []const i16` to `IvfQuantizedDataset`. Bump VERSION 5 → 6. Insert two `[K][14]i16` sections in the on-disk layout. `+56 KB`, no header change.
+- [x] **7.7.2** `dataset_blob.write` pre-pass to compute per-(cluster, feature) min/max before streaming features.
+- [x] **7.7.3** `search.euclidean_topk_q_ivf` adds a fourth step: bbox repair pass over unprobed clusters. PROBE stays at 8.
+- [x] **7.7.4** Re-prep, smoke, diagnose, k6.
+
+**Result**: **errors 7 → 0** (100% accuracy, FP=0, FN=0). `detection_score` pegged at formula max 3000. But **p99 0.62 ms → 4.72 ms** under k6's 250-VU concurrency — bbox prune costs more under contention than expected. **Final score 5,676.25 → 5,326.02** (-350). Architecture correct (exact by construction) but needs latency optimization to recover the score: sort unprobed clusters by centroid distance + SIMD the LB compute. Phase 7.8 candidate.
+
+---
+
 ## Phase 8 — Containerize against the rinha spec
 
 Goal: hand a docker image that the rinha harness can run.
