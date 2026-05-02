@@ -1,0 +1,10 @@
+{
+    "participants": ["Pedro André"],
+    "social": [
+        "https://github.com/pandrRe",
+        "https://www.linkedin.com/in/pedro-andr%C3%A9-39777b174/"
+    ],
+    "source-code-repo": "https://github.com/pandrRe/rinhapuffer",
+    "stack": ["zig", "haproxy"],
+    "open_to_work": false
+}
