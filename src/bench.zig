@@ -19,7 +19,7 @@ const STDJSON_RUNS = 3; // std.json is slow; fewer runs to keep total wall time 
 const PAYLOAD_RUNS = 7;
 const PAYLOAD_BATCH_REPEATS = 1000; // amortise per-payload measurement: vectorize the whole batch this many times per timed run.
 const MAX_PAYLOADS = 128;
-const SEARCH_QUERIES = 32; // distinct queries used in cosine_topk distribution.
+const SEARCH_QUERIES = 32; // distinct queries used in euclidean_topk distribution.
 const SEARCH_PASSES = 200; // each pass scans the full dataset once per query.
 
 fn now_ns() u64 {
@@ -432,7 +432,7 @@ const SearchStats = struct {
     n_rows: usize,
     queries: usize,
     passes: usize,
-    // ns per cosine_topk call.
+    // ns per euclidean_topk call.
     min_ns: f64,
     p50_ns: f64,
     p95_ns: f64,
@@ -442,7 +442,7 @@ const SearchStats = struct {
     stddev_ns: f64,
 };
 
-/// f32 query builder for `bench_cosine_topk_f32`. Mirrors `build_search_queries_q`
+/// f32 query builder for `bench_euclidean_topk_f32`. Mirrors `build_search_queries_q`
 /// but reads f32 features directly.
 fn build_search_queries_f32(
     ds: transform_reference.Dataset,
@@ -460,7 +460,7 @@ fn build_search_queries_f32(
 }
 
 /// Build `SEARCH_QUERIES` queries by sampling rows from the quantized dataset
-/// (dequantizing on the fly) and perturbing them slightly so cosine_topk_q
+/// (dequantizing on the fly) and perturbing them slightly so euclidean_topk_q
 /// can't shortcut to score=1. Works against either `QuantizedDataset` or
 /// `IvfQuantizedDataset` (both have the same `features`/`mins`/`inv_scales`
 /// shape for raw row reads).
@@ -494,7 +494,7 @@ fn brute_view(qds: transform_reference.IvfQuantizedDataset) transform_reference.
     };
 }
 
-fn bench_cosine_topk_f32(allocator: std.mem.Allocator) !SearchStats {
+fn bench_euclidean_topk_f32(allocator: std.mem.Allocator) !SearchStats {
     // Dequantize the v2 blob into a 168 MB f32 buffer so we can bench the
     // unquantized inner loop against the quantized one over the same data.
     var blob = try dataset_blob.load_unquant(allocator, DATASET_BIN_PATH);
@@ -508,7 +508,7 @@ fn bench_cosine_topk_f32(allocator: std.mem.Allocator) !SearchStats {
     var out: [search.TOP_K]u32 = undefined;
 
     for (&queries) |*q| {
-        search.cosine_topk(ds, q, &out);
+        search.euclidean_topk(ds, q, &out);
         anchor +%= out[0];
     }
 
@@ -520,7 +520,7 @@ fn bench_cosine_topk_f32(allocator: std.mem.Allocator) !SearchStats {
     for (0..SEARCH_PASSES) |_| {
         for (&queries) |*q| {
             const a = now_ns();
-            search.cosine_topk(ds, q, &out);
+            search.euclidean_topk(ds, q, &out);
             const b = now_ns();
             samples[idx] = b - a;
             idx += 1;
@@ -557,8 +557,8 @@ fn bench_cosine_topk_f32(allocator: std.mem.Allocator) !SearchStats {
 }
 
 /// IVF top-K bench. Production path. Reports recall@5 vs brute-force
-/// `cosine_topk_q` on the same query set.
-fn bench_cosine_topk_q_ivf(allocator: std.mem.Allocator, recall_out: *f64) !SearchStats {
+/// `euclidean_topk_q` on the same query set.
+fn bench_euclidean_topk_q_ivf(allocator: std.mem.Allocator, recall_out: *f64) !SearchStats {
     var blob = try dataset_blob.load(DATASET_BIN_PATH);
     defer blob.deinit();
     const qds = blob.dataset;
@@ -569,10 +569,10 @@ fn bench_cosine_topk_q_ivf(allocator: std.mem.Allocator, recall_out: *f64) !Sear
 
     // Compute brute-force ground-truth top-5 per query, then mean recall@5.
     var brute_tops: [SEARCH_QUERIES][search.TOP_K]u32 = undefined;
-    for (&queries, 0..) |*q, qi| search.cosine_topk_q(brute, q, &brute_tops[qi]);
+    for (&queries, 0..) |*q, qi| search.euclidean_topk_q(brute, q, &brute_tops[qi]);
 
     var ivf_tops: [SEARCH_QUERIES][search.TOP_K]u32 = undefined;
-    for (&queries, 0..) |*q, qi| search.cosine_topk_q_ivf(qds, q, &ivf_tops[qi]);
+    for (&queries, 0..) |*q, qi| search.euclidean_topk_q_ivf(qds, q, &ivf_tops[qi]);
 
     var hits_total: usize = 0;
     for (0..SEARCH_QUERIES) |qi| {
@@ -591,7 +591,7 @@ fn bench_cosine_topk_q_ivf(allocator: std.mem.Allocator, recall_out: *f64) !Sear
 
     // Warm pass.
     for (&queries) |*q| {
-        search.cosine_topk_q_ivf(qds, q, &out);
+        search.euclidean_topk_q_ivf(qds, q, &out);
         anchor +%= out[0];
     }
 
@@ -603,7 +603,7 @@ fn bench_cosine_topk_q_ivf(allocator: std.mem.Allocator, recall_out: *f64) !Sear
     for (0..SEARCH_PASSES) |_| {
         for (&queries) |*q| {
             const a = now_ns();
-            search.cosine_topk_q_ivf(qds, q, &out);
+            search.euclidean_topk_q_ivf(qds, q, &out);
             const b = now_ns();
             samples[idx] = b - a;
             idx += 1;
@@ -640,8 +640,8 @@ fn bench_cosine_topk_q_ivf(allocator: std.mem.Allocator, recall_out: *f64) !Sear
 }
 
 /// Brute-force quantized top-K bench. Kept for side-by-side comparison
-/// against `cosine_topk_q_ivf`.
-fn bench_cosine_topk_q_brute(allocator: std.mem.Allocator) !SearchStats {
+/// against `euclidean_topk_q_ivf`.
+fn bench_euclidean_topk_q_brute(allocator: std.mem.Allocator) !SearchStats {
     var blob = try dataset_blob.load(DATASET_BIN_PATH);
     defer blob.deinit();
     const brute = brute_view(blob.dataset);
@@ -653,7 +653,7 @@ fn bench_cosine_topk_q_brute(allocator: std.mem.Allocator) !SearchStats {
     var out: [search.TOP_K]u32 = undefined;
 
     for (&queries) |*q| {
-        search.cosine_topk_q(brute, q, &out);
+        search.euclidean_topk_q(brute, q, &out);
         anchor +%= out[0];
     }
 
@@ -665,7 +665,7 @@ fn bench_cosine_topk_q_brute(allocator: std.mem.Allocator) !SearchStats {
     for (0..SEARCH_PASSES) |_| {
         for (&queries) |*q| {
             const a = now_ns();
-            search.cosine_topk_q(brute, q, &out);
+            search.euclidean_topk_q(brute, q, &out);
             const b = now_ns();
             samples[idx] = b - a;
             idx += 1;
@@ -864,7 +864,7 @@ pub fn main(init: std.process.Init) !void {
     print_per_call_stats("payload.vectorize", per_call);
 
     // Probe dataset.bin once — both benches below consume it. Run the
-    // dataset_blob.load bench BEFORE cosine_topk: the load path doesn't fault
+    // dataset_blob.load bench BEFORE euclidean_topk: the load path doesn't fault
     // any feature pages (header-only access), so it measures cold-cache state,
     // which is what the boot path will actually see in production.
     var probe3 = dataset_blob.load(DATASET_BIN_PATH) catch |err| switch (err) {
@@ -890,17 +890,17 @@ pub fn main(init: std.process.Init) !void {
     });
 
     var recall: f64 = 0;
-    const search_stats_ivf = try bench_cosine_topk_q_ivf(allocator, &recall);
-    print_search_stats("search.cosine_topk_q_ivf", search_stats_ivf);
-    std.debug.print("    mean recall@5:    {d:.3} (vs cosine_topk_q brute force)\n", .{recall});
+    const search_stats_ivf = try bench_euclidean_topk_q_ivf(allocator, &recall);
+    print_search_stats("search.euclidean_topk_q_ivf", search_stats_ivf);
+    std.debug.print("    mean recall@5:    {d:.3} (vs euclidean_topk_q brute force)\n", .{recall});
 
     std.debug.print("\n=== cosine top-K (quantized u16, brute force) ===\n\n", .{});
 
-    const search_stats_q = try bench_cosine_topk_q_brute(allocator);
-    print_search_stats("search.cosine_topk_q", search_stats_q);
+    const search_stats_q = try bench_euclidean_topk_q_brute(allocator);
+    print_search_stats("search.euclidean_topk_q", search_stats_q);
 
     std.debug.print("\n=== cosine top-K (unquantized f32, brute force) ===\n\n", .{});
 
-    const search_stats_f32 = try bench_cosine_topk_f32(allocator);
-    print_search_stats("search.cosine_topk", search_stats_f32);
+    const search_stats_f32 = try bench_euclidean_topk_f32(allocator);
+    print_search_stats("search.euclidean_topk", search_stats_f32);
 }

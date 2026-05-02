@@ -203,7 +203,7 @@ pub fn load(path: []const u8) LoadError!IvfQuantizedBlob {
 
 /// f32 dataset materialised by dequantizing a v3 blob. Owns the f32 feature
 /// and label buffers; the source mmap is closed before this returns. Provided
-/// for benchmarking parity against `cosine_topk` — production never pays the
+/// for benchmarking parity against `euclidean_topk` — production never pays the
 /// 168 MB allocation. The cluster reordering is preserved (rows are still
 /// grouped by cluster) which doesn't change search semantics.
 pub const UnquantBlob = struct {
@@ -555,7 +555,7 @@ test "v3 quantization precision per element after permutation" {
     }
 }
 
-test "v3 PROBE=K equivalence: cosine_topk_q_ivf matches cosine_topk_q" {
+test "v3 PROBE=K equivalence: euclidean_topk_q_ivf matches euclidean_topk_q" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -596,9 +596,9 @@ test "v3 PROBE=K equivalence: cosine_topk_q_ivf matches cosine_topk_q" {
     for (&queries) |*q| {
         var got_brute: [search.TOP_K]u32 = undefined;
         var got_ivf: [search.TOP_K]u32 = undefined;
-        search.cosine_topk_q(qds_brute, q, &got_brute);
+        search.euclidean_topk_q(qds_brute, q, &got_brute);
         // Full coverage means scan every cluster — must match brute force exactly.
-        search.cosine_topk_q_ivf_full(qds_ivf, q, &got_ivf);
+        search.euclidean_topk_q_ivf_full(qds_ivf, q, &got_ivf);
         try std.testing.expectEqualSlices(u32, &got_brute, &got_ivf);
     }
 }

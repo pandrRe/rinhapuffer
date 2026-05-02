@@ -10,7 +10,7 @@ pub const N_FEATURES: usize = 14;
 /// contiguous across all records — ideal for per-feature SIMD reductions.
 ///
 /// **Rows are L2-normalized**: `Σ_k features[k*n+r]² ≈ 1.0` for every row.
-/// `parse_into` establishes this invariant; `search.cosine_topk` relies on it
+/// `parse_into` establishes this invariant; `search.euclidean_topk` relies on it
 /// to skip the per-row divide.
 ///
 /// Buffers are caller-owned. `Dataset` only holds aliasing views.
@@ -27,7 +27,7 @@ pub const Dataset = struct {
 /// `inv_scales` cached at load time from the per-feature `(min, scale)` pairs
 /// in the blob header.
 ///
-/// `cosine_topk_q` consumes this view directly without materialising f32
+/// `euclidean_topk_q` consumes this view directly without materialising f32
 /// columns; only `@floatFromInt(u16) → f32` happens per row in the inner loop.
 pub const QuantizedDataset = struct {
     n: usize,

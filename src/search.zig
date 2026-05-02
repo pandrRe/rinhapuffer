@@ -32,7 +32,7 @@ const Vu16 = @Vector(W, u16);
 /// of `transform_reference.parse_into`). The query `q` may have any norm; the
 /// returned indices are correct cosine top-K since `|q|` is constant across
 /// the scan and dividing by it is order-preserving.
-pub fn cosine_topk(
+pub fn euclidean_topk(
     ds: transform_reference.Dataset,
     q: *const [N_FEATURES]f32,
     out: *[TOP_K]u32,
@@ -81,7 +81,7 @@ pub fn cosine_topk(
 }
 
 /// Cosine top-K over a `QuantizedDataset` (u16 features, per-feature
-/// `(min, inv_scale)`). Algebraically equivalent to `cosine_topk`:
+/// `(min, inv_scale)`). Algebraically equivalent to `euclidean_topk`:
 ///
 /// ```
 /// dot = Σ q[k] * (r_u16[k] * inv_scale[k] + min[k])
@@ -91,7 +91,7 @@ pub fn cosine_topk(
 ///
 /// So the inner per-row work is one `@floatFromInt(Vu16) -> Vec` convert and
 /// one FMA per feature — no per-row affine reconstruction.
-pub fn cosine_topk_q(
+pub fn euclidean_topk_q(
     qds: transform_reference.QuantizedDataset,
     q: *const [N_FEATURES]f32,
     out: *[TOP_K]u32,
@@ -191,7 +191,7 @@ const PROBE_CLUSTERS: usize = 8;
 /// Production IVF cosine top-K. Score query against all centroids, pick the
 /// top-`PROBE_CLUSTERS` by score, scan only those slabs with the Phase 4
 /// dot-product algebra.
-pub fn cosine_topk_q_ivf(
+pub fn euclidean_topk_q_ivf(
     qds: transform_reference.IvfQuantizedDataset,
     q: *const [N_FEATURES]f32,
     out: *[TOP_K]u32,
@@ -224,10 +224,10 @@ pub fn cosine_topk_q_ivf(
 }
 
 /// Test-only: scan every cluster (PROBE = K). Used by `dataset_blob.zig`
-/// equivalence tests against `cosine_topk_q` with K small enough that PROBE
+/// equivalence tests against `euclidean_topk_q` with K small enough that PROBE
 /// would be ≥ K. Iterates `qds.cluster_starts` directly so it's correct for
 /// any `k_clusters`.
-pub fn cosine_topk_q_ivf_full(
+pub fn euclidean_topk_q_ivf_full(
     qds: transform_reference.IvfQuantizedDataset,
     q: *const [N_FEATURES]f32,
     out: *[TOP_K]u32,
@@ -323,7 +323,7 @@ inline fn scan_one(
 
 const fast_json = @import("fast_json.zig");
 
-test "cosine_topk hand-built tiny dataset" {
+test "euclidean_topk hand-built tiny dataset" {
     // 5 rows, 14 features, column-major. Query [1,0,0,...,0].
     // Each row is a unit vector with a chosen cosine vs query.
     const n: usize = 5;
@@ -348,13 +348,13 @@ test "cosine_topk hand-built tiny dataset" {
     q[0] = 1.0;
 
     var out: [TOP_K]u32 = undefined;
-    cosine_topk(ds, &q, &out);
+    euclidean_topk(ds, &q, &out);
 
     // Highest-cosine row first.
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4 }, &out);
 }
 
-test "cosine_topk SIMD-tail: rows just past a W boundary" {
+test "euclidean_topk SIMD-tail: rows just past a W boundary" {
     // n = 10 = W + 2 → exercises both the SIMD batch and the scalar tail.
     // Construct unit-norm rows with strictly decreasing cosine vs q=[1,0,...]:
     // feature_0 = c, feature_1 = sqrt(1 - c²) → dot(q, r) = c.
@@ -378,7 +378,7 @@ test "cosine_topk SIMD-tail: rows just past a W boundary" {
     q[0] = 1.0;
 
     var out: [TOP_K]u32 = undefined;
-    cosine_topk(ds, &q, &out);
+    euclidean_topk(ds, &q, &out);
 
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4 }, &out);
 }
@@ -386,8 +386,8 @@ test "cosine_topk SIMD-tail: rows just past a W boundary" {
 /// Naive O(n log n) reference: compute every cosine, sort all, return top-K.
 /// Computes `|r|` independently in f64 — does **not** trust the dataset's
 /// unit-norm post-condition. That way this differential test catches
-/// regressions in either `parse_into`'s normalization or `cosine_topk`'s math.
-fn naive_cosine_topk(
+/// regressions in either `parse_into`'s normalization or `euclidean_topk`'s math.
+fn naive_euclidean_topk(
     allocator: std.mem.Allocator,
     ds: transform_reference.Dataset,
     q: *const [N_FEATURES]f32,
@@ -427,7 +427,7 @@ fn naive_cosine_topk(
     return out;
 }
 
-test "cosine_topk vs naive on example-references.json" {
+test "euclidean_topk vs naive on example-references.json" {
     const allocator = std.testing.allocator;
 
     var mapped = try fast_json.mmap_file("./resources/example-references.json");
@@ -457,8 +457,8 @@ test "cosine_topk vs naive on example-references.json" {
 
     for (&queries, 0..) |*q, qi| {
         var got: [TOP_K]u32 = undefined;
-        cosine_topk(ds, q, &got);
-        const want = try naive_cosine_topk(allocator, ds, q);
+        euclidean_topk(ds, q, &got);
+        const want = try naive_euclidean_topk(allocator, ds, q);
 
         std.testing.expectEqualSlices(u32, &want, &got) catch |err| {
             std.debug.print("query #{d}: got {any}, want {any}\n", .{ qi, got, want });
@@ -467,7 +467,7 @@ test "cosine_topk vs naive on example-references.json" {
     }
 }
 
-test "cosine_topk_q_ivf hand-built tiny clustered dataset" {
+test "euclidean_topk_q_ivf hand-built tiny clustered dataset" {
     // 10 rows in 14 features. Rows 0..4 cluster around +e0, rows 5..9 around +e1.
     // K=2, PROBE=8 (capped to k_clusters=2 effectively, but we use _full for clarity).
     // Query toward +e0 must return rows 0..4 (the cluster near +e0).
@@ -544,7 +544,7 @@ test "cosine_topk_q_ivf hand-built tiny clustered dataset" {
     q[0] = 1.0;
 
     var out: [TOP_K]u32 = undefined;
-    cosine_topk_q_ivf_full(qds, &q, &out);
+    euclidean_topk_q_ivf_full(qds, &q, &out);
 
     // The 5 rows of cluster 0 (rows 0..4) — order by score descending. Row 0
     // has 0 jitter on f2 so it's exactly e0 → highest cosine. Rows 1..4 have
@@ -553,8 +553,8 @@ test "cosine_topk_q_ivf hand-built tiny clustered dataset" {
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4 }, &out);
 }
 
-test "cosine_topk_q hand-built tiny dataset" {
-    // Same setup as `cosine_topk hand-built tiny dataset`, then quantize the
+test "euclidean_topk_q hand-built tiny dataset" {
+    // Same setup as `euclidean_topk hand-built tiny dataset`, then quantize the
     // f32 columns into a QuantizedDataset built directly (no blob round-trip).
     const n: usize = 5;
     const expected_cos = [5]f32{ 1.0, 0.9, 0.5, 0.0, -1.0 };
@@ -604,7 +604,7 @@ test "cosine_topk_q hand-built tiny dataset" {
     q[0] = 1.0;
 
     var out: [TOP_K]u32 = undefined;
-    cosine_topk_q(qds, &q, &out);
+    euclidean_topk_q(qds, &q, &out);
 
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4 }, &out);
 }

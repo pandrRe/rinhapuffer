@@ -84,7 +84,7 @@ fn handle_fraud_score(req: http.Request) http.Response {
         return .{ .status = 400, .body = "", .content_type = "text/plain", .keep_alive = ka(req) };
     };
     const qds = blob.?.dataset;
-    search.cosine_topk_q_ivf(qds, &q_buf, &top_rows);
+    search.euclidean_topk_q_ivf(qds, &q_buf, &top_rows);
 
     var fraud_count: u8 = 0;
     inline for (0..TOP_K) |i| {
@@ -122,7 +122,7 @@ const transform_reference = @import("transform_reference.zig");
 const fast_json = @import("fast_json.zig");
 
 // Fixture K must be ≥ `search` PROBE_CLUSTERS (8) so the production
-// `cosine_topk_q_ivf` invariant holds. The example-references dataset has
+// `euclidean_topk_q_ivf` invariant holds. The example-references dataset has
 // 100 rows, so K=8 leaves ~12 rows/cluster — plenty for k-means to converge.
 const TEST_K: u32 = 8;
 
