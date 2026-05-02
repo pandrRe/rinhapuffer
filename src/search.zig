@@ -120,9 +120,17 @@ pub fn euclidean_topk_q(
     inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
 }
 
-/// Production IVF Euclidean top-K. Float Euclidean against the (small) set of
-/// centroids picks the top-`PROBE_CLUSTERS`; int Euclidean scans only those
-/// row slabs.
+/// Production IVF Euclidean top-K — **exact**, regardless of PROBE.
+///
+/// Float Euclidean against the centroids picks `PROBE_CLUSTERS` for the
+/// initial int scan (tight upper bound on the K-th best distance). Then a
+/// **bbox repair pass** walks every other cluster: for each, compute the
+/// axis-aligned lower bound `LB² = Σ_k max(0, max(q − hi, lo − q))²` from
+/// the cluster's per-feature `[lo, hi]`. If `LB² ≥ top_dists[0]`, no point
+/// in the cluster can improve us — skip. Otherwise scan it. By construction
+/// every cluster containing a true top-K neighbour passes the prune (its
+/// neighbour's true distance ≤ current K-th best ≤ LB), so the result is
+/// exact.
 pub fn euclidean_topk_q_ivf(
     qds: transform_reference.IvfQuantizedDataset,
     q: *const [N_FEATURES]f32,
@@ -152,20 +160,56 @@ pub fn euclidean_topk_q_ivf(
         }
     }
 
-    // Step 3: int Euclidean over rows in selected clusters.
+    // Step 3: int Euclidean over rows in selected clusters → tight top-K bound.
     var q_int: [N_FEATURES]i16 = undefined;
     quantize_query(q, &q_int);
 
     var top_dists: [TOP_K]i64 = @splat(std.math.maxInt(i64));
     var top_rows: [TOP_K]u32 = @splat(0);
 
+    var probed: [MAX_K_CLUSTERS]bool = @splat(false);
     for (probe_clusters[0..]) |c| {
+        probed[c] = true;
+        const start = qds.cluster_starts[c];
+        const end = qds.cluster_starts[c + 1];
+        scan_range_int(qds.features, qds.n, start, end, &q_int, &top_dists, &top_rows);
+    }
+
+    // Step 4: bbox repair pass over the remaining clusters. Most prune cheaply
+    // (bbox LB > current K-th best); the few that survive get scanned to
+    // guarantee exact top-K.
+    for (0..qds.k_clusters) |c| {
+        if (probed[c]) continue;
+        const lb = bbox_lower_bound_sq(&q_int, qds.bbox_lo, qds.bbox_hi, c);
+        if (lb >= top_dists[0]) continue;
         const start = qds.cluster_starts[c];
         const end = qds.cluster_starts[c + 1];
         scan_range_int(qds.features, qds.n, start, end, &q_int, &top_dists, &top_rows);
     }
 
     inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
+}
+
+/// Axis-aligned squared distance from query to cluster `c`'s bounding box.
+/// Per feature, contributes `(below_lo)²` if `q < lo`, `(above_hi)²` if
+/// `q > hi`, else 0. Widening pattern matches `scan_range_int`.
+inline fn bbox_lower_bound_sq(
+    q_int: *const [N_FEATURES]i16,
+    bbox_lo: []const i16,
+    bbox_hi: []const i16,
+    c: usize,
+) i64 {
+    var lb: i64 = 0;
+    inline for (0..N_FEATURES) |k| {
+        const lo: i32 = bbox_lo[c * N_FEATURES + k];
+        const hi: i32 = bbox_hi[c * N_FEATURES + k];
+        const qv: i32 = q_int[k];
+        const below_lo: i32 = lo - qv;
+        const above_hi: i32 = qv - hi;
+        const d: i32 = @max(0, @max(below_lo, above_hi));
+        lb += @as(i64, d) * @as(i64, d);
+    }
+    return lb;
 }
 
 /// Test-only: scan every cluster (PROBE = K). Used by `dataset_blob.zig`
@@ -314,6 +358,32 @@ fn quantize_dataset(comptime n: usize, src: *const [N_FEATURES * n]f32, dst: *[N
     for (0..N_FEATURES * n) |i| {
         const q = @round(src[i] * fix_scale_f);
         dst[i] = @intFromFloat(@max(lo_clamp, @min(hi_clamp, q)));
+    }
+}
+
+/// Compute per-(cluster, feature) min/max from an i16 column-major dataset.
+/// Test-only helper mirroring `dataset_blob.write`'s bbox accumulation.
+fn compute_bboxes(
+    comptime n: usize,
+    comptime k_clusters: usize,
+    features: *const [N_FEATURES * n]i16,
+    cluster_starts: *const [k_clusters + 1]u32,
+    bbox_lo: *[k_clusters * N_FEATURES]i16,
+    bbox_hi: *[k_clusters * N_FEATURES]i16,
+) void {
+    @memset(bbox_lo, std.math.maxInt(i16));
+    @memset(bbox_hi, std.math.minInt(i16));
+    for (0..k_clusters) |c| {
+        const cs = cluster_starts[c];
+        const ce = cluster_starts[c + 1];
+        for (0..N_FEATURES) |k| {
+            const slot = c * N_FEATURES + k;
+            for (cs..ce) |row| {
+                const v = features[k * n + row];
+                if (v < bbox_lo[slot]) bbox_lo[slot] = v;
+                if (v > bbox_hi[slot]) bbox_hi[slot] = v;
+            }
+        }
     }
 }
 
@@ -471,6 +541,10 @@ test "euclidean_topk_q_ivf hand-built tiny clustered dataset" {
 
     const cluster_starts = [_]u32{ 0, 5, 10 };
 
+    var bbox_lo: [k_clusters * N_FEATURES]i16 = undefined;
+    var bbox_hi: [k_clusters * N_FEATURES]i16 = undefined;
+    compute_bboxes(n, k_clusters, &i16_features, &cluster_starts, &bbox_lo, &bbox_hi);
+
     const qds: transform_reference.IvfQuantizedDataset = .{
         .n = n,
         .k_clusters = k_clusters,
@@ -478,6 +552,8 @@ test "euclidean_topk_q_ivf hand-built tiny clustered dataset" {
         .labels = &labels,
         .centroids = &centroids,
         .cluster_starts = &cluster_starts,
+        .bbox_lo = &bbox_lo,
+        .bbox_hi = &bbox_hi,
     };
 
     var q: [N_FEATURES]f32 = @splat(0);

@@ -39,9 +39,13 @@ pub const QuantizedDataset = struct {
 /// every feature column), with `centroids` row-major over `[k_clusters][14]f32`
 /// (centroids stay in float for cheap PROBE selection — only ~1024 of them).
 ///
-/// Search picks the top-N centroids by min Euclidean distance to the query
-/// (in float), then scans only those clusters' row slices with the int
-/// Euclidean inner loop.
+/// `bbox_lo` and `bbox_hi` are per-cluster, per-feature axis-aligned bounds in
+/// i16 quantized units. Search picks the top-N centroids by min Euclidean
+/// distance to the query, scans those clusters' row slices in int, then runs
+/// a **bbox repair pass** over the remaining clusters: for each, compute the
+/// axis-aligned lower-bound distance `LB² = Σ_k max(0, max(q_k − hi_k,
+/// lo_k − q_k))²`. Skip if `LB² ≥ current K-th best`; scan otherwise. The
+/// pass guarantees exact top-K regardless of PROBE.
 pub const IvfQuantizedDataset = struct {
     n: usize,
     k_clusters: usize,
@@ -49,6 +53,10 @@ pub const IvfQuantizedDataset = struct {
     labels: []const bool,
     centroids: []const f32,
     cluster_starts: []const u32,
+    /// `[k_clusters * N_FEATURES]i16` — per-(cluster, feature) min, AoS by cluster.
+    bbox_lo: []const i16,
+    /// `[k_clusters * N_FEATURES]i16` — per-(cluster, feature) max, AoS by cluster.
+    bbox_hi: []const i16,
 };
 
 pub const Error = fast_json.ParseError || error{BufferTooSmall};

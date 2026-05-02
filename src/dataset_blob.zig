@@ -1,21 +1,22 @@
 //! On-disk format for the prepped reference dataset, plus mmap-only `load`
 //! and `write` (used by the `prep` build step).
 //!
-//! Layout v5 (little-endian, native f32 IEEE 754). Storage switched from
-//! per-column-quantized u16 (v3/v4) to globally-scaled i16 with the single
-//! `search.FIX_SCALE` constant. Header lost the per-column `(min, scale)`
-//! table — there is just one global scale, persisted so the loader can reject
-//! stale blobs built against a different value of FIX_SCALE.
+//! Layout v6 (little-endian, native f32 IEEE 754). Adds per-cluster
+//! axis-aligned bounding boxes (i16 lo/hi per feature) so search can prove
+//! exact top-K via a lower-bound-distance prune over unprobed clusters.
+//! Bytes-on-disk = v5 + 2 × K × N_FEATURES × 2.
 //!
 //!     offset           size                          field
 //!     0                4                             magic = "RBP1"
-//!     4                4                             version: u32 = 5
+//!     4                4                             version: u32 = 6
 //!     8                4                             n: u32   (record count)
 //!     12               4                             k_clusters: u32 (= 1024 in prod)
 //!     16               4                             fix_scale: i32 (= search.FIX_SCALE)
 //!     20               12                            zero pad to 32-byte alignment
 //!     32               k_clusters * N_FEATURES * 4   centroids: [K][14]f32 row-major
-//!     32 + K*14*4      (k_clusters + 1) * 4          cluster_starts: [K+1]u32
+//!     +K*14*4          (k_clusters + 1) * 4          cluster_starts: [K+1]u32
+//!     +(K+1)*4         k_clusters * N_FEATURES * 2   bbox_lo: [K][14]i16 row-major  ← NEW
+//!     +K*14*2          k_clusters * N_FEATURES * 2   bbox_hi: [K][14]i16 row-major  ← NEW
 //!     pad to 16        0–15                          zero pad
 //!     features_offset  N_FEATURES * n * 2            features: i16 column-major (rows reordered by cluster)
 //!     labels_offset    n                             labels: u8 (0=legit, 1=fraud)
@@ -28,8 +29,12 @@
 //! IVF metadata: rows are reordered cluster-by-cluster so that all rows
 //! assigned to centroid `c` occupy `[cluster_starts[c], cluster_starts[c+1])`
 //! in every feature column. `cluster_starts[K] == n`. Search probes the
-//! top-N centroids by Euclidean distance to the (float) query and scans only
-//! those slabs in integer space.
+//! top-N centroids by Euclidean distance to the (float) query, scans those
+//! slabs in integer space, then runs a bbox repair pass over the remaining
+//! clusters: each cluster's per-feature `[lo, hi]` gives an axis-aligned
+//! lower bound on min distance to any point inside; clusters whose LB ≥
+//! current K-th best are provably pruneable, otherwise scanned. Result is
+//! exact top-K regardless of the PROBE budget.
 //!
 //! Endianness is native LE — both dev (macOS arm64) and target (x86_64 Linux)
 //! are LE.
@@ -43,7 +48,7 @@ const search = @import("search.zig");
 const N_FEATURES = transform_reference.N_FEATURES;
 
 pub const MAGIC: u32 = std.mem.readInt(u32, "RBP1", .little);
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 /// Production cluster count. Persisted in the header so loaders can reject
 /// blobs built with a different topology (`error.UnsupportedKClusters`).
@@ -80,25 +85,33 @@ comptime {
 pub const Offsets = struct {
     centroids: usize,
     cluster_starts: usize,
+    bbox_lo: usize,
+    bbox_hi: usize,
     features: usize,
     labels: usize,
     total: usize,
 };
 
-/// Compute byte offsets and total file size for a v5 blob with the given
+/// Compute byte offsets and total file size for a v6 blob with the given
 /// `n` and `k_clusters`. Features are 16-byte-aligned by inserting up to 15
-/// pad bytes after `cluster_starts`.
+/// pad bytes after `bbox_hi`.
 pub fn offsets(n: u32, k_clusters: u32) Offsets {
     const centroids = HEADER_SIZE;
     const centroids_size = @as(usize, k_clusters) * N_FEATURES * @sizeOf(f32);
     const cluster_starts = centroids + centroids_size;
     const cluster_starts_end = cluster_starts + (@as(usize, k_clusters) + 1) * @sizeOf(u32);
-    const features = std.mem.alignForward(usize, cluster_starts_end, 16);
+    const bbox_lo = cluster_starts_end;
+    const bbox_size = @as(usize, k_clusters) * N_FEATURES * @sizeOf(i16);
+    const bbox_hi = bbox_lo + bbox_size;
+    const bbox_hi_end = bbox_hi + bbox_size;
+    const features = std.mem.alignForward(usize, bbox_hi_end, 16);
     const features_size = N_FEATURES * @as(usize, n) * @sizeOf(i16);
     const labels = features + features_size;
     return .{
         .centroids = centroids,
         .cluster_starts = cluster_starts,
+        .bbox_lo = bbox_lo,
+        .bbox_hi = bbox_hi,
         .features = features,
         .labels = labels,
         .total = labels + n,
@@ -156,6 +169,12 @@ pub fn load(path: []const u8) LoadError!IvfQuantizedBlob {
     const starts_ptr: [*]const u32 = @ptrCast(@alignCast(mapped.bytes.ptr + off.cluster_starts));
     const cluster_starts = starts_ptr[0 .. @as(usize, hdr.k_clusters) + 1];
 
+    const bbox_count = @as(usize, hdr.k_clusters) * N_FEATURES;
+    const bbox_lo_ptr: [*]const i16 = @ptrCast(@alignCast(mapped.bytes.ptr + off.bbox_lo));
+    const bbox_lo = bbox_lo_ptr[0..bbox_count];
+    const bbox_hi_ptr: [*]const i16 = @ptrCast(@alignCast(mapped.bytes.ptr + off.bbox_hi));
+    const bbox_hi = bbox_hi_ptr[0..bbox_count];
+
     const features_count = @as(usize, hdr.n) * N_FEATURES;
     const features_ptr: [*]const i16 = @ptrCast(@alignCast(mapped.bytes.ptr + off.features));
     const features = features_ptr[0..features_count];
@@ -174,11 +193,13 @@ pub fn load(path: []const u8) LoadError!IvfQuantizedBlob {
             .labels = labels,
             .centroids = centroids,
             .cluster_starts = cluster_starts,
+            .bbox_lo = bbox_lo,
+            .bbox_hi = bbox_hi,
         },
     };
 }
 
-/// f32 dataset materialised by dequantizing a v5 blob. Owns the f32 feature
+/// f32 dataset materialised by dequantizing a v6 blob. Owns the f32 feature
 /// and label buffers; the source mmap is closed before this returns. Provided
 /// for benchmarking parity against `euclidean_topk` — production never pays the
 /// 168 MB allocation. The cluster reordering is preserved (rows are still
@@ -314,27 +335,64 @@ pub fn write(
         .k_clusters = k_clusters,
         .fix_scale = search.FIX_SCALE,
     };
+    // Per-cluster axis-aligned bbox accumulators. Initialized so an empty
+    // cluster (lo > hi) makes the search-time LB compute return a huge
+    // positive number → cluster always pruned. Computed in a pre-pass so
+    // they can be written to disk in their proper position (before features
+    // in the streaming layout); the second pass below re-runs the same
+    // quantize formula and streams the i16 columns out.
+    const bbox_count: usize = @as(usize, k_clusters) * N_FEATURES;
+    const bbox_lo = try allocator.alloc(i16, bbox_count);
+    defer allocator.free(bbox_lo);
+    const bbox_hi = try allocator.alloc(i16, bbox_count);
+    defer allocator.free(bbox_hi);
+    @memset(bbox_lo, std.math.maxInt(i16));
+    @memset(bbox_hi, std.math.minInt(i16));
+
+    const fix_scale_f: f32 = @floatFromInt(search.FIX_SCALE);
+    const lo_clamp: f32 = @floatFromInt(std.math.minInt(i16));
+    const hi_clamp: f32 = @floatFromInt(std.math.maxInt(i16));
+    for (0..k_clusters) |c| {
+        const cs = cluster_starts[c];
+        const ce = cluster_starts[c + 1];
+        for (0..N_FEATURES) |k| {
+            const slot = c * N_FEATURES + k;
+            var lo_v: i16 = std.math.maxInt(i16);
+            var hi_v: i16 = std.math.minInt(i16);
+            for (cs..ce) |new_idx| {
+                const old_row = perm[new_idx];
+                const f = ds.features[k * n + old_row];
+                const q = @round(f * fix_scale_f);
+                const clamped = @max(lo_clamp, @min(hi_clamp, q));
+                const v: i16 = @intFromFloat(clamped);
+                if (v < lo_v) lo_v = v;
+                if (v > hi_v) hi_v = v;
+            }
+            bbox_lo[slot] = lo_v;
+            bbox_hi[slot] = hi_v;
+        }
+    }
+
     try file.writeStreamingAll(io, std.mem.asBytes(&hdr));
     try file.writeStreamingAll(io, std.mem.sliceAsBytes(centroids));
     try file.writeStreamingAll(io, std.mem.sliceAsBytes(cluster_starts));
+    try file.writeStreamingAll(io, std.mem.sliceAsBytes(bbox_lo));
+    try file.writeStreamingAll(io, std.mem.sliceAsBytes(bbox_hi));
 
     // Pad to 16-align the features section.
     const off = offsets(n_u32, k_clusters);
     const written = HEADER_SIZE +
         centroids.len * @sizeOf(f32) +
-        cluster_starts.len * @sizeOf(u32);
+        cluster_starts.len * @sizeOf(u32) +
+        2 * bbox_count * @sizeOf(i16);
     std.debug.assert(written <= off.features);
     if (written < off.features) {
         var pad: [16]u8 = @splat(0);
         try file.writeStreamingAll(io, pad[0 .. off.features - written]);
     }
 
-    // Features: 14 columns × n rows, i16-quantized + permuted, written column-major
-    // in 2048-row chunks (a 4 KiB stack buffer of i16). Single global scale —
-    // no per-column min/scale to thread through.
-    const fix_scale_f: f32 = @floatFromInt(search.FIX_SCALE);
-    const lo_clamp: f32 = @floatFromInt(std.math.minInt(i16));
-    const hi_clamp: f32 = @floatFromInt(std.math.maxInt(i16));
+    // Features: 14 columns × n rows, i16-quantized + permuted, written
+    // column-major in 2048-row chunks (a 4 KiB stack buffer of i16).
     var i16_chunk: [2048]i16 = undefined;
     for (0..N_FEATURES) |k| {
         var i: usize = 0;
@@ -400,6 +458,12 @@ pub fn load_any_k(path: []const u8) LoadError!IvfQuantizedBlob {
     const starts_ptr: [*]const u32 = @ptrCast(@alignCast(mapped.bytes.ptr + off.cluster_starts));
     const cluster_starts = starts_ptr[0 .. @as(usize, hdr.k_clusters) + 1];
 
+    const bbox_count = @as(usize, hdr.k_clusters) * N_FEATURES;
+    const bbox_lo_ptr: [*]const i16 = @ptrCast(@alignCast(mapped.bytes.ptr + off.bbox_lo));
+    const bbox_lo = bbox_lo_ptr[0..bbox_count];
+    const bbox_hi_ptr: [*]const i16 = @ptrCast(@alignCast(mapped.bytes.ptr + off.bbox_hi));
+    const bbox_hi = bbox_hi_ptr[0..bbox_count];
+
     const features_count = @as(usize, hdr.n) * N_FEATURES;
     const features_ptr: [*]const i16 = @ptrCast(@alignCast(mapped.bytes.ptr + off.features));
     const features = features_ptr[0..features_count];
@@ -416,11 +480,13 @@ pub fn load_any_k(path: []const u8) LoadError!IvfQuantizedBlob {
             .labels = labels,
             .centroids = centroids,
             .cluster_starts = cluster_starts,
+            .bbox_lo = bbox_lo,
+            .bbox_hi = bbox_hi,
         },
     };
 }
 
-test "write/load v3 round-trip with IVF metadata" {
+test "write/load v6 round-trip with IVF metadata" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -680,6 +746,33 @@ test "load rejects v4 (raw-Euclidean per-column quantized format)" {
     }
 
     const path = try tmp_abs_path(allocator, &tmp, "v4.bin");
+    defer allocator.free(path);
+    try std.testing.expectError(error.UnsupportedVersion, load(path));
+}
+
+test "load rejects v5 (no bbox columns)" {
+    // v5 has the same header shape as v6 but no per-cluster bbox sections.
+    // The v6 reader expects bboxes, so reject by version.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var f = try tmp.dir.createFile(io, "v5.bin", .{});
+        defer f.close(io);
+        const hdr: Header = .{
+            .magic = MAGIC,
+            .version = 5,
+            .n = 0,
+            .k_clusters = K_CLUSTERS,
+            .fix_scale = search.FIX_SCALE,
+        };
+        try f.writeStreamingAll(io, std.mem.asBytes(&hdr));
+    }
+
+    const path = try tmp_abs_path(allocator, &tmp, "v5.bin");
     defer allocator.free(path);
     try std.testing.expectError(error.UnsupportedVersion, load(path));
 }

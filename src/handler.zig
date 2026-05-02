@@ -121,9 +121,9 @@ pub fn deinit_for_test() void {
 const transform_reference = @import("transform_reference.zig");
 const fast_json = @import("fast_json.zig");
 
-// Fixture K must be ≥ `search` PROBE_CLUSTERS (8) so the production
+// Fixture K must be ≥ `search` PROBE_CLUSTERS so the production
 // `euclidean_topk_q_ivf` invariant holds. The example-references dataset has
-// 100 rows, so K=8 leaves ~12 rows/cluster — plenty for k-means to converge.
+// 100 rows so K up to ~50 leaves enough rows/cluster for k-means to converge.
 const TEST_K: u32 = 8;
 
 fn tmp_abs_path(
