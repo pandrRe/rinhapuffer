@@ -9,6 +9,14 @@ services:
     depends_on:
       - api1
       - api2
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    sysctls:
+      net.core.somaxconn: 4096
     deploy:
       resources:
         limits:
@@ -21,6 +29,8 @@ services:
       - RINHAPUFFER_SOCKET=/sockets/api1.sock
     volumes:
       - sockets:/sockets
+    security_opt:
+      - seccomp=unconfined
     deploy:
       resources:
         limits:
@@ -33,6 +43,8 @@ services:
       - RINHAPUFFER_SOCKET=/sockets/api2.sock
     volumes:
       - sockets:/sockets
+    security_opt:
+      - seccomp=unconfined
     deploy:
       resources:
         limits:
