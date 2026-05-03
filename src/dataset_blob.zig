@@ -208,6 +208,13 @@ pub fn prefault_and_lock(blob: *const IvfQuantizedBlob) void {
         // madvise takes [*]u8; the mmap is PRIVATE+READ so the cast is
         // kernel-side only (no actual write to the mapping).
         const ptr = @constCast(bytes.ptr);
+        // HUGEPAGE first, then populate. Hint must precede the fault-in so
+        // the kernel maps in 2 MB chunks instead of 4 KB pages — collapses
+        // ~80 MB into ~40 PMD entries instead of ~20k PTEs, slashing TLB
+        // misses on cold IVF probes. Best-effort: file-backed THP needs
+        // CONFIG_READ_ONLY_THP_FOR_FS; older/stripped kernels return EINVAL
+        // and the populate path below still gives us 4 KB pages — no harm.
+        _ = linux.madvise(ptr, bytes.len, linux.MADV.HUGEPAGE);
         _ = linux.madvise(ptr, bytes.len, linux.MADV.WILLNEED);
         _ = linux.madvise(ptr, bytes.len, MADV_POPULATE_READ);
     }
