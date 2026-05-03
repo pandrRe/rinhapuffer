@@ -1,27 +1,20 @@
 services:
   lb:
-    image: haproxy:3.0-alpine
-    # `-db` = foreground, single-process. Override the image entrypoint
-    # (which prepends `-W` for master-worker mode) so haproxy runs as a
-    # single PID 1 process — saves the master watchdog (~8 MB RSS) and
-    # one fork. Docker's restart policy stands in for the crash-restart
-    # that the master would have provided. We don't need SIGUSR2 reload
-    # during the eval window.
-    entrypoint: ["haproxy", "-db", "-f", "/usr/local/etc/haproxy/haproxy.cfg"]
+    # rinhalb: round-robin TCP→UDS L4 splicer. Single static musl binary,
+    # raw io_uring + splice(2) zero-copy. See lb/ for the source.
+    image: ${RINHALB_IMAGE:-ghcr.io/pandrre/rinhalb:latest}
+    environment:
+      - RINHALB_LISTEN=0.0.0.0:9999
+      - RINHALB_BACKENDS=/sockets/api1.sock,/sockets/api2.sock
     ports:
       - "9999:9999"
     volumes:
-      - ./infra/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - sockets:/sockets
     depends_on:
       - api1
       - api2
     security_opt:
       - seccomp=unconfined
-    # Read root-owned UDS sockets in the shared `sockets` volume — the api
-    # containers run as root and bind sockets with default umask. HAProxy's
-    # alpine image otherwise drops to uid 99 (haproxy), which can't connect.
-    user: "0"
     ulimits:
       nofile:
         soft: 65535
