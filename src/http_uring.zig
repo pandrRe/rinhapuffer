@@ -5,8 +5,8 @@
 //!
 //! Milestones (incremental, see plan in `~/.claude/plans/`):
 //!   M1 — skeleton: multishot accept, close on accept.
-//!   M2 (this commit) — one-shot recv + writev + close (functional correctness).
-//!   M3 — registered files (fixed-file table).
+//!   M2 — one-shot recv + writev + close (functional correctness).
+//!   M3 (this commit) — registered files via accept_multishot_direct.
 //!   M4 — BUF_RING for recv.
 //!   M5 — multishot recv.
 //!   M6 — TCP_NODELAY, generation tag, dedup helpers, polish.
@@ -38,7 +38,7 @@ const SQ_DEPTH: u16 = 1024;
 const CQES_PER_BATCH: usize = 256;
 
 // user_data tag layout (u64):
-//   bits 0..15   slot index (0..MAX_CONNS-1, or 0xffff for orphan close)
+//   bits 0..15   slot index (0..MAX_CONNS-1)
 //   bits 16..23  op tag      (ACCEPT, RECV, WRITEV, CLOSE)
 //   bits 24..31  generation  (M6 — bumped on slot reuse for stale-CQE drop)
 //   bits 32..63  reserved
@@ -46,10 +46,6 @@ const OP_ACCEPT: u8 = 0;
 const OP_RECV: u8 = 1;
 const OP_WRITEV: u8 = 2;
 const OP_CLOSE: u8 = 3;
-
-// Sentinel slot for ops that aren't tied to a pool entry (e.g. async-close
-// of an accept-orphan when the pool is exhausted).
-const ORPHAN_SLOT: u16 = 0xffff;
 
 inline fn make_user_data(slot: u16, op: u8, gen: u8) u64 {
     return (@as(u64, gen) << 24) | (@as(u64, op) << 16) | @as(u64, slot);
@@ -84,9 +80,11 @@ const Conn = struct {
     write_keep_alive: bool,
 };
 
-var conn_pool: [MAX_CONNS]Conn = undefined;
-var free_list: [MAX_CONNS]u16 = undefined;
-var free_top: u16 = 0;
+// Conn slot is identified directly by the kernel-allocated registered-file
+// index; `accept_multishot_direct` picks a free slot in [0, MAX_CONNS) and
+// returns it in `cqe.res`. No user-space free list — the kernel manages
+// slot allocation against the sparse table registered at startup.
+var conns: [MAX_CONNS]Conn = undefined;
 
 // Set once by `run()`; read by callbacks. Single process per backend → safe.
 var dispatch_fn: http.Handler = undefined;
@@ -105,7 +103,12 @@ pub fn run(listen_fd: i32, dispatch: http.Handler) RunError!noreturn {
     var ring = linux.IoUring.init_params(SQ_DEPTH, &params) catch return error.InitFailed;
     defer ring.deinit();
 
-    pool_reset();
+    // Sparse registered-file table: MAX_CONNS slots reserved for
+    // accept_multishot_direct's auto-allocation. Listen fd stays raw — we
+    // never IOSQE_FIXED_FILE on the accept SQE's input fd.
+    ring.register_files_sparse(MAX_CONNS) catch return error.InitFailed;
+
+    for (0..MAX_CONNS) |i| conns[i].in_use = false;
     instrument.init();
 
     arm_accept(&ring, listen_fd) catch return error.SubmitFailed;
@@ -134,53 +137,27 @@ fn dispatch_cqe(ring: *linux.IoUring, listen_fd: i32, cqe: linux.io_uring_cqe) R
     }
 }
 
-// ─── connection pool ───────────────────────────────────────────────────────
-
-fn pool_reset() void {
-    for (0..MAX_CONNS) |i| {
-        conn_pool[i].in_use = false;
-        // LIFO: pop returns smaller indices first (cache-friendly).
-        free_list[i] = @intCast(MAX_CONNS - 1 - i);
-    }
-    free_top = MAX_CONNS;
-}
-
-fn pool_alloc() ?u16 {
-    if (free_top == 0) return null;
-    free_top -= 1;
-    return free_list[free_top];
-}
-
-fn pool_free(idx: u16) void {
-    conn_pool[idx].in_use = false;
-    free_list[free_top] = idx;
-    free_top += 1;
-}
-
 // ─── accept ─────────────────────────────────────────────────────────────────
 
 fn arm_accept(ring: *linux.IoUring, listen_fd: i32) !void {
-    _ = try ring.accept_multishot(make_user_data(0, OP_ACCEPT, 0), listen_fd, null, null, 0);
+    // Direct multishot accept: kernel-allocates a registered-file slot per
+    // accepted connection and reports that slot index in cqe.res. Saves a
+    // per-accept io_uring_register(REGISTER_FILES_UPDATE) syscall vs the
+    // raw-fd accept_multishot variant.
+    _ = try ring.accept_multishot_direct(make_user_data(0, OP_ACCEPT, 0), listen_fd, null, null, 0);
 }
 
 fn handle_accept(ring: *linux.IoUring, listen_fd: i32, cqe: linux.io_uring_cqe) RunError!void {
     if (cqe.res >= 0) {
-        const fd: i32 = cqe.res;
+        const slot: u16 = @intCast(cqe.res);
+        std.debug.assert(slot < MAX_CONNS);
         instrument.inc(&instrument.accepts, 1);
 
-        const slot = pool_alloc() orelse {
-            // Pool exhausted — close the orphan asynchronously so haproxy can
-            // rebalance. No slot to free; user_data carries ORPHAN_SLOT.
-            _ = ring.close(make_user_data(ORPHAN_SLOT, OP_CLOSE, 0), fd) catch {
-                // Ring full of SQEs — fall back to sync close so we don't leak fds.
-                _ = linux.close(fd);
-            };
-            return;
-        };
-
-        const conn = &conn_pool[slot];
+        const conn = &conns[slot];
         conn.* = .{
-            .fd = fd,
+            // fd is left zeroed — all subsequent ops use the registered-file
+            // index (`slot`) with IOSQE_FIXED_FILE, never the raw fd.
+            .fd = 0,
             .state = .normal,
             .in_use = true,
             .recv_in_flight = false,
@@ -198,8 +175,9 @@ fn handle_accept(ring: *linux.IoUring, listen_fd: i32, cqe: linux.io_uring_cqe) 
 
         submit_recv(ring, slot) catch return error.SubmitFailed;
     }
-    // Per-accept error path: multishot stays armed via F_MORE — only re-arm
-    // when the kernel says it's done with this multishot SQE.
+    // res < 0 covers per-accept errors (incl. -ENFILE when the registered
+    // table is full → connection stays in the listen queue, kernel keeps
+    // the multishot armed via F_MORE). Drop silently.
 
     if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
         arm_accept(ring, listen_fd) catch return error.AcceptMultishotLost;
@@ -209,19 +187,22 @@ fn handle_accept(ring: *linux.IoUring, listen_fd: i32, cqe: linux.io_uring_cqe) 
 // ─── recv ──────────────────────────────────────────────────────────────────
 
 fn submit_recv(ring: *linux.IoUring, slot: u16) !void {
-    const conn = &conn_pool[slot];
+    const conn = &conns[slot];
     if (conn.have >= READ_BUF_SIZE) return; // buffer full; can't accept more
     if (conn.recv_in_flight) return;
     const ud = make_user_data(slot, OP_RECV, 0);
     const buf = conn.read_buf[conn.have..];
-    _ = try ring.recv(ud, conn.fd, .{ .buffer = buf }, 0);
+    // Pass the registered-file index in place of an fd; IOSQE_FIXED_FILE
+    // tells the kernel to dereference it through the registered table.
+    const sqe = try ring.recv(ud, @intCast(slot), .{ .buffer = buf }, 0);
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
     conn.recv_in_flight = true;
 }
 
 fn handle_recv(ring: *linux.IoUring, cqe: linux.io_uring_cqe) RunError!void {
     const slot = ud_slot(cqe.user_data);
     if (slot >= MAX_CONNS) return;
-    const conn = &conn_pool[slot];
+    const conn = &conns[slot];
     if (!conn.in_use) return;
     conn.recv_in_flight = false;
 
@@ -247,7 +228,7 @@ fn handle_recv(ring: *linux.IoUring, cqe: linux.io_uring_cqe) RunError!void {
 // ─── parse + dispatch ──────────────────────────────────────────────────────
 
 fn parse_loop(ring: *linux.IoUring, slot: u16) !void {
-    const conn = &conn_pool[slot];
+    const conn = &conns[slot];
     while (conn.state == .normal and !conn.write_in_flight) {
         const head_end_opt = std.mem.indexOf(u8, conn.read_buf[0..conn.have], "\r\n\r\n");
         const head_end = head_end_opt orelse return;
@@ -305,7 +286,7 @@ fn advance_read(conn: *Conn, consumed: usize) void {
 // ─── write ──────────────────────────────────────────────────────────────────
 
 fn submit_writev(ring: *linux.IoUring, slot: u16) !void {
-    const conn = &conn_pool[slot];
+    const conn = &conns[slot];
     var iov_buf: [2]posix.iovec_const = undefined;
     var iov_count: usize = 0;
     if (conn.write_iov_idx == 0) {
@@ -322,14 +303,15 @@ fn submit_writev(ring: *linux.IoUring, slot: u16) !void {
         return; // already drained
     }
     const ud = make_user_data(slot, OP_WRITEV, 0);
-    _ = try ring.writev(ud, conn.fd, iov_buf[0..iov_count], 0);
+    const sqe = try ring.writev(ud, @intCast(slot), iov_buf[0..iov_count], 0);
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
     conn.write_in_flight = true;
 }
 
 fn handle_writev(ring: *linux.IoUring, cqe: linux.io_uring_cqe) RunError!void {
     const slot = ud_slot(cqe.user_data);
     if (slot >= MAX_CONNS) return;
-    const conn = &conn_pool[slot];
+    const conn = &conns[slot];
     if (!conn.in_use) return;
     conn.write_in_flight = false;
 
@@ -389,7 +371,7 @@ fn advance_write(conn: *Conn, n: usize) void {
 // ─── close ──────────────────────────────────────────────────────────────────
 
 fn start_close(ring: *linux.IoUring, slot: u16) !void {
-    const conn = &conn_pool[slot];
+    const conn = &conns[slot];
     if (conn.state == .closing) return;
     conn.state = .closing;
     if (conn.write_in_flight) {
@@ -397,22 +379,24 @@ fn start_close(ring: *linux.IoUring, slot: u16) !void {
         // its own error/keep-alive=false path. Don't double-submit close.
         return;
     }
+    // close_direct closes the underlying fd AND releases the registered-file
+    // slot back to the kernel's auto-alloc pool — next accept_multishot_direct
+    // can pick this slot again.
     const ud = make_user_data(slot, OP_CLOSE, 0);
-    _ = try ring.close(ud, conn.fd);
+    _ = try ring.close_direct(ud, slot);
 }
 
 fn handle_close(cqe: linux.io_uring_cqe) void {
     const slot = ud_slot(cqe.user_data);
-    if (slot == ORPHAN_SLOT) return; // pool-exhausted accept-orphan close
     if (slot >= MAX_CONNS) return;
-    pool_free(slot);
+    conns[slot].in_use = false;
     instrument.inc(&instrument.conn_closes, 1);
 }
 
 // ─── error responses ───────────────────────────────────────────────────────
 
 fn send_status_close(ring: *linux.IoUring, slot: u16, status: u16) !void {
-    const conn = &conn_pool[slot];
+    const conn = &conns[slot];
     const resp: http.Response = .{
         .status = status,
         .body = "",
@@ -474,28 +458,6 @@ fn map_parse_status(err: http.ParseError) u16 {
 }
 
 // ─── tests ─────────────────────────────────────────────────────────────────
-
-test "pool: alloc/free LIFO" {
-    pool_reset();
-    const a = pool_alloc().?;
-    const b = pool_alloc().?;
-    try std.testing.expect(a != b);
-    pool_free(a);
-    pool_free(b);
-    const c = pool_alloc().?;
-    const d = pool_alloc().?;
-    try std.testing.expectEqual(b, c);
-    try std.testing.expectEqual(a, d);
-}
-
-test "pool: exhaustion returns null" {
-    pool_reset();
-    var allocated: [MAX_CONNS]u16 = undefined;
-    for (0..MAX_CONNS) |i| allocated[i] = pool_alloc().?;
-    try std.testing.expectEqual(@as(?u16, null), pool_alloc());
-    for (allocated) |idx| pool_free(idx);
-    try std.testing.expect(pool_alloc() != null);
-}
 
 test "user_data tag pack/unpack round-trip" {
     const ud = make_user_data(42, OP_RECV, 7);
