@@ -9,10 +9,18 @@ services:
     depends_on:
       - api1
       - api2
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    sysctls:
+      net.core.somaxconn: 4096
     deploy:
       resources:
         limits:
-          cpus: "0.30"
+          cpus: "0.50"
           memory: "30MB"
 
   api1:
@@ -21,10 +29,12 @@ services:
       - RINHAPUFFER_SOCKET=/sockets/api1.sock
     volumes:
       - sockets:/sockets
+    security_opt:
+      - seccomp=unconfined
     deploy:
       resources:
         limits:
-          cpus: "0.35"
+          cpus: "0.25"
           memory: "160MB"
 
   api2:
@@ -33,10 +43,12 @@ services:
       - RINHAPUFFER_SOCKET=/sockets/api2.sock
     volumes:
       - sockets:/sockets
+    security_opt:
+      - seccomp=unconfined
     deploy:
       resources:
         limits:
-          cpus: "0.35"
+          cpus: "0.25"
           memory: "160MB"
 
 volumes:
