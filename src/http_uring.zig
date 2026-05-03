@@ -6,8 +6,8 @@
 //! Milestones (incremental, see plan in `~/.claude/plans/`):
 //!   M1 — skeleton: multishot accept, close on accept.
 //!   M2 — one-shot recv + writev + close (functional correctness).
-//!   M3 (this commit) — registered files via accept_multishot_direct.
-//!   M4 — BUF_RING for recv.
+//!   M3 — registered files via accept_multishot_direct.
+//!   M4 (this commit) — BUF_RING for recv (kernel-provided buffers).
 //!   M5 — multishot recv.
 //!   M6 — TCP_NODELAY, generation tag, dedup helpers, polish.
 //!
@@ -36,6 +36,15 @@ pub const HEAD_BUF_SIZE: usize = 256;
 // power of two with headroom.
 const SQ_DEPTH: u16 = 1024;
 const CQES_PER_BATCH: usize = 256;
+
+// Provided-buffer ring: one 8 KiB buffer per slot. `accept_multishot_direct`
+// caps live conns at MAX_CONNS, so PBUF_COUNT == MAX_CONNS guarantees the
+// kernel never runs out of buffers under normal load. Power-of-two enforced
+// by `setup_buf_ring`.
+const PBUF_COUNT: u16 = MAX_CONNS;
+const PBUF_SIZE: usize = READ_BUF_SIZE;
+const PBUF_GROUP: u16 = 0;
+const PBUF_MASK: u16 = PBUF_COUNT - 1;
 
 // user_data tag layout (u64):
 //   bits 0..15   slot index (0..MAX_CONNS-1)
@@ -86,6 +95,13 @@ const Conn = struct {
 // slot allocation against the sparse table registered at startup.
 var conns: [MAX_CONNS]Conn = undefined;
 
+// Provided-buffer ring backing storage. Page-aligned so the addresses the
+// kernel sees (via `buf_ring_add`) are stable across reuse. `pbuf_ring` is
+// the mmap'd shared header from `setup_buf_ring` — kernel and user share
+// it lock-free (kernel reads tail, user writes tail).
+var pbuf_storage: [PBUF_COUNT][PBUF_SIZE]u8 align(std.heap.page_size_min) = undefined;
+var pbuf_ring: *align(std.heap.page_size_min) linux.io_uring_buf_ring = undefined;
+
 // Set once by `run()`; read by callbacks. Single process per backend → safe.
 var dispatch_fn: http.Handler = undefined;
 
@@ -107,6 +123,22 @@ pub fn run(listen_fd: i32, dispatch: http.Handler) RunError!noreturn {
     // accept_multishot_direct's auto-allocation. Listen fd stays raw — we
     // never IOSQE_FIXED_FILE on the accept SQE's input fd.
     ring.register_files_sparse(MAX_CONNS) catch return error.InitFailed;
+
+    // Provided-buffer ring: register, then publish all PBUF_COUNT buffers
+    // in one batched advance. After this, recv SQEs can use BUFFER_SELECT
+    // and the kernel picks a buf for each completion.
+    pbuf_ring = linux.IoUring.setup_buf_ring(ring.fd, PBUF_COUNT, PBUF_GROUP, .{ .inc = false }) catch return error.InitFailed;
+    linux.IoUring.buf_ring_init(pbuf_ring);
+    for (0..PBUF_COUNT) |i| {
+        linux.IoUring.buf_ring_add(
+            pbuf_ring,
+            pbuf_storage[i][0..],
+            @intCast(i),
+            PBUF_MASK,
+            @intCast(i),
+        );
+    }
+    linux.IoUring.buf_ring_advance(pbuf_ring, PBUF_COUNT);
 
     for (0..MAX_CONNS) |i| conns[i].in_use = false;
     instrument.init();
@@ -188,13 +220,18 @@ fn handle_accept(ring: *linux.IoUring, listen_fd: i32, cqe: linux.io_uring_cqe) 
 
 fn submit_recv(ring: *linux.IoUring, slot: u16) !void {
     const conn = &conns[slot];
-    if (conn.have >= READ_BUF_SIZE) return; // buffer full; can't accept more
+    if (conn.have >= READ_BUF_SIZE) return; // scratch full; can't accept more
     if (conn.recv_in_flight) return;
     const ud = make_user_data(slot, OP_RECV, 0);
-    const buf = conn.read_buf[conn.have..];
-    // Pass the registered-file index in place of an fd; IOSQE_FIXED_FILE
-    // tells the kernel to dereference it through the registered table.
-    const sqe = try ring.recv(ud, @intCast(slot), .{ .buffer = buf }, 0);
+    // BUFFER_SELECT: kernel picks a free buf from BUF_RING `PBUF_GROUP` per
+    // completion. We copy from that buf into `conn.read_buf` so the parser
+    // can hold a stable view across recvs and re-arm the buffer back to the
+    // ring immediately. `len` here is the per-buffer max the kernel may
+    // write — must match the actual buffer size advertised in `buf_ring_add`.
+    const sqe = try ring.recv(ud, @intCast(slot), .{ .buffer_selection = .{
+        .group_id = PBUF_GROUP,
+        .len = PBUF_SIZE,
+    } }, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     conn.recv_in_flight = true;
 }
@@ -206,12 +243,40 @@ fn handle_recv(ring: *linux.IoUring, cqe: linux.io_uring_cqe) RunError!void {
     if (!conn.in_use) return;
     conn.recv_in_flight = false;
 
-    if (cqe.res <= 0) {
-        // res < 0: I/O error. res == 0: peer half-closed. Either way, close.
+    if (cqe.res < 0) {
+        // -ENOBUFS: ring temporarily empty. We always release a buf back per
+        // successful recv, so this only fires under high concurrency edge
+        // cases — the recv is silently dropped, just resubmit.
+        if (cqe.res == -@as(i32, @intFromEnum(linux.E.NOBUFS))) {
+            submit_recv(ring, slot) catch return error.SubmitFailed;
+            return;
+        }
         start_close(ring, slot) catch return error.SubmitFailed;
         return;
     }
-    conn.have += @intCast(cqe.res);
+    if (cqe.res == 0) {
+        // peer half-closed. (BUFFER_SELECT recvs with res==0 don't have
+        // F_BUFFER set — no buffer to release.)
+        start_close(ring, slot) catch return error.SubmitFailed;
+        return;
+    }
+
+    // Decode the kernel-picked buffer ID from cqe.flags, copy into the
+    // parser-stable scratch, then re-publish the buf back to the ring so
+    // it's immediately available for the next recv.
+    const buf_id = cqe.buffer_id() catch {
+        // CQE has no F_BUFFER bit despite res > 0 — unexpected; treat as
+        // recv error and close.
+        start_close(ring, slot) catch return error.SubmitFailed;
+        return;
+    };
+    const n: usize = @intCast(cqe.res);
+    const room = READ_BUF_SIZE - @as(usize, conn.have);
+    const take = @min(n, room);
+    @memcpy(conn.read_buf[conn.have .. @as(usize, conn.have) + take], pbuf_storage[buf_id][0..take]);
+    conn.have += @intCast(take);
+    linux.IoUring.buf_ring_add(pbuf_ring, pbuf_storage[buf_id][0..], buf_id, PBUF_MASK, 0);
+    linux.IoUring.buf_ring_advance(pbuf_ring, 1);
 
     parse_loop(ring, slot) catch return error.SubmitFailed;
 
