@@ -141,9 +141,23 @@ pub const RunError = error{
 pub fn run(listen_fd: i32, dispatch: http.Handler) RunError!noreturn {
     dispatch_fn = dispatch;
 
-    // Plain io_uring init for now; SETUP optimization flags layered later.
+    // Tail-latency tuning. SINGLE_ISSUER tells the kernel exactly one task
+    // ever submits SQEs (true here — `run` is the only submitter), skipping
+    // multi-issuer serialization. DEFER_TASKRUN coalesces task-work onto the
+    // next io_uring_enter instead of running it inline at completion time,
+    // which cuts wakeup churn on multishot CQEs. COOP_TASKRUN avoids inter-
+    // processor interrupts when the kernel posts CQEs from another core.
+    // All three need 5.19+ (DEFER_TASKRUN requires 6.1; gracefully fall back
+    // if the kernel rejects the combo).
     var params: linux.io_uring_params = std.mem.zeroes(linux.io_uring_params);
-    var ring = linux.IoUring.init_params(SQ_DEPTH, &params) catch return error.InitFailed;
+    params.flags = linux.IORING_SETUP_SINGLE_ISSUER |
+        linux.IORING_SETUP_DEFER_TASKRUN |
+        linux.IORING_SETUP_COOP_TASKRUN;
+    var ring = linux.IoUring.init_params(SQ_DEPTH, &params) catch blk: {
+        // Older kernel rejected the flag combo. Retry with no flags.
+        params = std.mem.zeroes(linux.io_uring_params);
+        break :blk linux.IoUring.init_params(SQ_DEPTH, &params) catch return error.InitFailed;
+    };
     defer ring.deinit();
 
     // Sparse registered-file table: MAX_CONNS slots reserved for
