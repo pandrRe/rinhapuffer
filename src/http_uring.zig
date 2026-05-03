@@ -7,8 +7,8 @@
 //!   M1 — skeleton: multishot accept, close on accept.
 //!   M2 — one-shot recv + writev + close (functional correctness).
 //!   M3 — registered files via accept_multishot_direct.
-//!   M4 (this commit) — BUF_RING for recv (kernel-provided buffers).
-//!   M5 — multishot recv.
+//!   M4 — BUF_RING for recv (kernel-provided buffers).
+//!   M5 (this commit) — multishot recv.
 //!   M6 — TCP_NODELAY, generation tag, dedup helpers, polish.
 //!
 //! Kernel floor is 5.19 (multishot accept). Multishot recv (6.0) lands in M5.
@@ -74,7 +74,10 @@ const Conn = struct {
     fd: i32,
     state: ConnState,
     in_use: bool,
-    recv_in_flight: bool,
+    // True while a multishot recv SQE is live on this slot. The kernel keeps
+    // re-firing recv CQEs (one per data arrival) until F_MORE is clear or an
+    // error terminates the multishot — only then do we re-arm.
+    recv_armed: bool,
     write_in_flight: bool,
 
     read_buf: [READ_BUF_SIZE]u8,
@@ -192,7 +195,7 @@ fn handle_accept(ring: *linux.IoUring, listen_fd: i32, cqe: linux.io_uring_cqe) 
             .fd = 0,
             .state = .normal,
             .in_use = true,
-            .recv_in_flight = false,
+            .recv_armed = false,
             .write_in_flight = false,
             .read_buf = undefined,
             .have = 0,
@@ -221,19 +224,20 @@ fn handle_accept(ring: *linux.IoUring, listen_fd: i32, cqe: linux.io_uring_cqe) 
 fn submit_recv(ring: *linux.IoUring, slot: u16) !void {
     const conn = &conns[slot];
     if (conn.have >= READ_BUF_SIZE) return; // scratch full; can't accept more
-    if (conn.recv_in_flight) return;
+    if (conn.recv_armed) return;
     const ud = make_user_data(slot, OP_RECV, 0);
-    // BUFFER_SELECT: kernel picks a free buf from BUF_RING `PBUF_GROUP` per
-    // completion. We copy from that buf into `conn.read_buf` so the parser
-    // can hold a stable view across recvs and re-arm the buffer back to the
-    // ring immediately. `len` here is the per-buffer max the kernel may
-    // write — must match the actual buffer size advertised in `buf_ring_add`.
+    // BUFFER_SELECT + RECV_MULTISHOT: kernel keeps firing CQEs for every
+    // recv on this fd, picking a free buf from BUF_RING per completion,
+    // until F_MORE is clear (typically -ENOBUFS or peer-close). One SQE
+    // per conn lifetime, not per request — the steady-state syscall budget
+    // collapses to one io_uring_enter per loop tick.
     const sqe = try ring.recv(ud, @intCast(slot), .{ .buffer_selection = .{
         .group_id = PBUF_GROUP,
         .len = PBUF_SIZE,
     } }, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
-    conn.recv_in_flight = true;
+    sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
+    conn.recv_armed = true;
 }
 
 fn handle_recv(ring: *linux.IoUring, cqe: linux.io_uring_cqe) RunError!void {
@@ -241,14 +245,23 @@ fn handle_recv(ring: *linux.IoUring, cqe: linux.io_uring_cqe) RunError!void {
     if (slot >= MAX_CONNS) return;
     const conn = &conns[slot];
     if (!conn.in_use) return;
-    conn.recv_in_flight = false;
+
+    // Multishot recv: F_MORE clear means the kernel has retired this SQE.
+    // Common causes: -ENOBUFS (ring empty), -ECONNRESET, peer half-close
+    // with res==0, or some error paths. Once retired we must explicitly
+    // re-arm to keep receiving.
+    if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
+        conn.recv_armed = false;
+    }
 
     if (cqe.res < 0) {
-        // -ENOBUFS: ring temporarily empty. We always release a buf back per
-        // successful recv, so this only fires under high concurrency edge
-        // cases — the recv is silently dropped, just resubmit.
+        // -ENOBUFS is recoverable — we always release a buf back on every
+        // successful recv, so it's effectively only the burst-startup case.
+        // Re-arm and continue. Other negatives are I/O errors → close.
         if (cqe.res == -@as(i32, @intFromEnum(linux.E.NOBUFS))) {
-            submit_recv(ring, slot) catch return error.SubmitFailed;
+            if (conn.state == .normal and !conn.recv_armed and conn.have < READ_BUF_SIZE) {
+                submit_recv(ring, slot) catch return error.SubmitFailed;
+            }
             return;
         }
         start_close(ring, slot) catch return error.SubmitFailed;
@@ -280,8 +293,9 @@ fn handle_recv(ring: *linux.IoUring, cqe: linux.io_uring_cqe) RunError!void {
 
     parse_loop(ring, slot) catch return error.SubmitFailed;
 
-    // Re-arm recv unless we're closing or the buffer is full.
-    if (conn.state == .normal and !conn.recv_in_flight and conn.have < READ_BUF_SIZE) {
+    // If the multishot terminated (F_MORE was clear) and we're still alive
+    // with room, re-arm. Otherwise the kernel keeps streaming — no SQE.
+    if (conn.state == .normal and !conn.recv_armed and conn.have < READ_BUF_SIZE) {
         submit_recv(ring, slot) catch return error.SubmitFailed;
     }
     // Buffer is full but no parseable request — header oversize.
@@ -402,7 +416,7 @@ fn handle_writev(ring: *linux.IoUring, cqe: linux.io_uring_cqe) RunError!void {
     // Try to dispatch the next pipelined request.
     parse_loop(ring, slot) catch return error.SubmitFailed;
     // Re-arm recv if room and no recv pending.
-    if (conn.state == .normal and !conn.recv_in_flight and conn.have < READ_BUF_SIZE) {
+    if (conn.state == .normal and !conn.recv_armed and conn.have < READ_BUF_SIZE) {
         submit_recv(ring, slot) catch return error.SubmitFailed;
     }
 }
