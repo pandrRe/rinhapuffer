@@ -47,9 +47,18 @@ pub fn build(b: *std.Build) void {
     // GET /__metrics. Default off — every callsite is comptime-gated to a
     // no-op so prod ships zero overhead. Flip with `-Dinstrument=true`.
     const instrument = b.option(bool, "instrument", "Enable hot-path instrumentation + /__metrics (default: false)") orelse false;
+    // HTTP backend selector (Linux only). `true` → io_uring (`http_uring.zig`),
+    // `false` → epoll (`http_async.zig`). Both branches comptime-resolved in
+    // `main.zig`; only the selected backend is linked.
+    const use_uring = b.option(bool, "uring", "Use io_uring HTTP backend on Linux (default: true)") orelse true;
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "keep_alive", keep_alive);
     build_opts.addOption(bool, "instrument", instrument);
+    build_opts.addOption(bool, "use_uring", use_uring);
+    // Materialize the build_options module once and share it across the
+    // library and exe modules — calling `addOptions` on each module would
+    // mint two distinct modules and zig would refuse the duplicate-source.
+    const build_opts_mod = build_opts.createModule();
 
     const mod = b.addModule("rinhapuffer", .{
         // The root source file is the "entry point" of this module. Users of
@@ -63,7 +72,7 @@ pub fn build(b: *std.Build) void {
         // which requires us to specify a target.
         .target = target,
     });
-    mod.addOptions("build_options", build_opts);
+    mod.addImport("build_options", build_opts_mod);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -113,6 +122,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "rinhapuffer", .module = mod },
         },
     });
+    // Mirror the build_options module onto the exe root so `main.zig` can
+    // comptime-branch on `build_options.use_uring` without re-exporting
+    // through `rinhapuffer`.
+    exe_mod.addImport("build_options", build_opts_mod);
     // The shared `mod` (root.zig) is also a libc consumer via
     // `dataset_blob.zig` (mmap/close) and `fast_json.zig` (fstat). Tests of
     // that module need libc as well.

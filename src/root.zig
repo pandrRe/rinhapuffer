@@ -13,10 +13,12 @@ pub const kmeans = @import("kmeans.zig");
 pub const http = @import("http.zig");
 pub const handler = @import("handler.zig");
 pub const instrument = @import("instrument.zig");
-// http_async is Linux-only (epoll). On other targets we expose an empty
-// namespace so this module still compiles; main.zig comptime-branches the
-// call site so the empty namespace is never used on Mac/etc.
+// http_async (epoll) and http_uring (io_uring) are both Linux-only. On other
+// targets we expose empty namespaces so this module still compiles; main.zig
+// comptime-branches the call site so the empty namespaces are never used on
+// Mac/etc.
 pub const http_async = if (builtin.os.tag == .linux) @import("http_async.zig") else struct {};
+pub const http_uring = if (builtin.os.tag == .linux) @import("http_uring.zig") else struct {};
 
 test {
     _ = fast_json;
@@ -28,5 +30,8 @@ test {
     _ = http;
     _ = handler;
     _ = instrument;
-    if (builtin.os.tag == .linux) _ = http_async;
+    if (builtin.os.tag == .linux) {
+        _ = http_async;
+        _ = http_uring;
+    }
 }

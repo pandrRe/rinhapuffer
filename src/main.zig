@@ -11,10 +11,12 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const rinhapuffer = @import("rinhapuffer");
 const http = rinhapuffer.http;
 const handler = rinhapuffer.handler;
 const http_async = rinhapuffer.http_async;
+const http_uring = rinhapuffer.http_uring;
 const libc = std.c;
 
 const PORT: u16 = 9999;
@@ -25,6 +27,11 @@ pub fn main(_: std.process.Init) !void {
     try handler.init_dataset(DATASET_PATH);
     handler.warmup(500);
 
+    const accept_label: []const u8 = if (comptime builtin.os.tag == .linux)
+        (if (build_options.use_uring) "io_uring" else "epoll")
+    else
+        "blocking";
+
     const listen_fd = blk: {
         if (libc.getenv(SOCKET_ENV)) |raw| {
             const path = std.mem.span(@as([*:0]const u8, raw));
@@ -32,7 +39,7 @@ pub fn main(_: std.process.Init) !void {
             std.debug.print("rinhapuffer listening on unix:{s} (keep-alive {s}, accept {s})\n", .{
                 path,
                 if (handler.KEEP_ALIVE) "on" else "off",
-                if (builtin.os.tag == .linux) "epoll" else "blocking",
+                accept_label,
             });
             break :blk fd;
         }
@@ -40,14 +47,18 @@ pub fn main(_: std.process.Init) !void {
         std.debug.print("rinhapuffer listening on 0.0.0.0:{d} (keep-alive {s}, accept {s})\n", .{
             PORT,
             if (handler.KEEP_ALIVE) "on" else "off",
-            if (builtin.os.tag == .linux) "epoll" else "blocking",
+            accept_label,
         });
         break :blk fd;
     };
     defer _ = libc.close(listen_fd);
 
     if (comptime builtin.os.tag == .linux) {
-        try http_async.run(@intCast(listen_fd), &handler.dispatch);
+        if (comptime build_options.use_uring) {
+            try http_uring.run(@intCast(listen_fd), &handler.dispatch);
+        } else {
+            try http_async.run(@intCast(listen_fd), &handler.dispatch);
+        }
     } else {
         while (true) {
             const client_fd = try http.accept_one(listen_fd);
