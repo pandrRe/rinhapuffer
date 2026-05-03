@@ -7,52 +7,107 @@
 //! update is the per-cluster mean. Empty clusters reseed from a random sample
 //! row.
 //!
+//! Init is k-means++ (Arthur & Vassilvitskii 2007): first centroid uniform,
+//! each subsequent one sampled with prob ∝ D²(row) against the running
+//! min-distance to already-chosen centroids. Vs vanilla random init this
+//! spreads seeds along the data manifold, dramatically reducing
+//! empty-cluster reseeds and final cluster-size variance — the latter
+//! matters for IVF tail latency since mega-clusters are scanned in full
+//! whenever they're probed.
+//!
 //! Determinism: same `seed` + same input ⇒ bit-identical centroids and
-//! assignments. Argmax tiebreak is "lowest cluster index wins", and the
-//! Fisher-Yates shuffle is driven by an explicitly-seeded `Xoshiro256`.
+//! assignments. Argmax tiebreak is "lowest cluster index wins", and both
+//! the k-means++ sampling and empty-cluster reseed are driven by an
+//! explicitly-seeded `Xoshiro256`.
 
 const std = @import("std");
 const transform_reference = @import("transform_reference.zig");
 
 const N_FEATURES = transform_reference.N_FEATURES;
 
-/// Initialise centroids from a random sample of rows, then alternate
+/// Initialise centroids via k-means++, then alternate
 /// assign-by-min-Euclidean / sum / mean for `n_iter` iterations. Final
 /// centroids land in `centroids_out` (row-major, `[c * N_FEATURES + k]`).
 ///
 /// Allocates: `[k_clusters * N_FEATURES]f32` sums + `[k_clusters]u32` counts +
-/// `[n_sample]u32` assignments + `[n_sample]u32` shuffle scratch +
+/// `[n]u32` assignments + `[n]f32` k-means++ min-D² scratch +
 /// `[k_clusters]f32` half-norm-sq cache.
 pub fn run_kmeans(
     allocator: std.mem.Allocator,
-    sample_features_soa: []const f32,
-    n_sample: usize,
+    features_soa: []const f32,
+    n: usize,
     k_clusters: usize,
     n_iter: usize,
     seed: u64,
     centroids_out: []f32,
 ) !void {
     std.debug.assert(centroids_out.len == k_clusters * N_FEATURES);
-    std.debug.assert(sample_features_soa.len == N_FEATURES * n_sample);
-    std.debug.assert(n_sample >= k_clusters);
+    std.debug.assert(features_soa.len == N_FEATURES * n);
+    std.debug.assert(n >= k_clusters);
 
     var prng = std.Random.Xoshiro256.init(seed);
     const rand = prng.random();
 
-    // Init: Fisher-Yates shuffle of [0..n_sample), take first K as init centroids.
-    const shuffle_idx = try allocator.alloc(u32, n_sample);
-    defer allocator.free(shuffle_idx);
-    for (0..n_sample) |i| shuffle_idx[i] = @intCast(i);
-    rand.shuffle(u32, shuffle_idx);
+    // Init: k-means++. `min_d_sq[r]` is the running squared distance from row
+    // r to its nearest already-chosen centroid; updated incrementally each
+    // time a new centroid is placed. Sampling proportional to `min_d_sq`
+    // gives each iteration a strong bias toward "uncovered" regions of the
+    // input space, which costs O(N·K·d) once at prep — same order as one
+    // Lloyd iteration.
+    const min_d_sq = try allocator.alloc(f32, n);
+    defer allocator.free(min_d_sq);
+    @memset(min_d_sq, std.math.inf(f32));
 
-    for (0..k_clusters) |c| {
-        const r = shuffle_idx[c];
-        for (0..N_FEATURES) |k| {
-            centroids_out[c * N_FEATURES + k] = sample_features_soa[k * n_sample + r];
+    {
+        const r0 = rand.uintLessThan(usize, n);
+        inline for (0..N_FEATURES) |k| {
+            centroids_out[0 * N_FEATURES + k] = features_soa[k * n + r0];
         }
     }
 
-    const assignments = try allocator.alloc(u32, n_sample);
+    for (1..k_clusters) |c| {
+        // Refresh `min_d_sq` against the centroid just placed (c-1) and
+        // accumulate the total weight in one pass. f64 accumulator because
+        // at n=3M the sum of f32 squared distances easily exceeds f32's
+        // 24-bit mantissa (~16M precision ceiling) and would round-down on
+        // the long tail.
+        const cm1 = c - 1;
+        var total: f64 = 0;
+        for (0..n) |row| {
+            var d: f32 = 0;
+            inline for (0..N_FEATURES) |k| {
+                const diff = features_soa[k * n + row] - centroids_out[cm1 * N_FEATURES + k];
+                d += diff * diff;
+            }
+            if (d < min_d_sq[row]) min_d_sq[row] = d;
+            total += min_d_sq[row];
+        }
+
+        // Sample row by inverse-CDF on min_d_sq. Degenerate fallback (every
+        // row exact-matches some chosen centroid → total == 0) picks
+        // uniformly so we don't divide by zero.
+        const pick: usize = if (total <= 0)
+            rand.uintLessThan(usize, n)
+        else blk: {
+            const u = rand.float(f64) * total;
+            var acc: f64 = 0;
+            var idx: usize = n - 1;
+            for (0..n) |row| {
+                acc += min_d_sq[row];
+                if (acc >= u) {
+                    idx = row;
+                    break;
+                }
+            }
+            break :blk idx;
+        };
+
+        inline for (0..N_FEATURES) |k| {
+            centroids_out[c * N_FEATURES + k] = features_soa[k * n + pick];
+        }
+    }
+
+    const assignments = try allocator.alloc(u32, n);
     defer allocator.free(assignments);
     const sums = try allocator.alloc(f32, k_clusters * N_FEATURES);
     defer allocator.free(sums);
@@ -75,7 +130,7 @@ pub fn run_kmeans(
         }
 
         // Assign: argmax (row·c − ½‖c‖²), tiebreak lowest cluster index.
-        for (0..n_sample) |row| {
+        for (0..n) |row| {
             var best: f32 = -std.math.inf(f32);
             var best_c: u32 = 0;
             for (0..k_clusters) |c| {
@@ -83,7 +138,7 @@ pub fn run_kmeans(
                 inline for (0..N_FEATURES) |k| {
                     dot = @mulAdd(
                         f32,
-                        sample_features_soa[k * n_sample + row],
+                        features_soa[k * n + row],
                         centroids_out[c * N_FEATURES + k],
                         dot,
                     );
@@ -100,20 +155,20 @@ pub fn run_kmeans(
         // Sum + count.
         @memset(sums, 0);
         @memset(counts, 0);
-        for (0..n_sample) |row| {
+        for (0..n) |row| {
             const c = assignments[row];
             counts[c] += 1;
             inline for (0..N_FEATURES) |k| {
-                sums[@as(usize, c) * N_FEATURES + k] += sample_features_soa[k * n_sample + row];
+                sums[@as(usize, c) * N_FEATURES + k] += features_soa[k * n + row];
             }
         }
 
-        // Update: empty → reseed from random sample row; else mean of cluster.
+        // Update: empty → reseed from random row; else mean of cluster.
         for (0..k_clusters) |c| {
             if (counts[c] == 0) {
-                const r = rand.uintLessThan(usize, n_sample);
+                const r = rand.uintLessThan(usize, n);
                 inline for (0..N_FEATURES) |k| {
-                    centroids_out[c * N_FEATURES + k] = sample_features_soa[k * n_sample + r];
+                    centroids_out[c * N_FEATURES + k] = features_soa[k * n + r];
                 }
                 continue;
             }

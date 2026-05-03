@@ -95,11 +95,13 @@ pub const PROBE_CLUSTERS: usize = 8;
 /// Random seed used for k-means init. Pinned so prep is deterministic.
 pub const KMEANS_SEED: u64 = 0xa5a5_a5a5_a5a5_a5a5;
 
-/// k-means iteration count for the 100k-row training sample.
-pub const KMEANS_ITERS: usize = 20;
-
-/// Cap on the random sample fed into k-means. Smaller datasets feed every row.
-pub const KMEANS_SAMPLE_CAP: usize = 100_000;
+/// k-means Lloyd-iteration count after k-means++ init. Higher than the
+/// pre-k-means++ default (20) because k-means++ delivers a usable starting
+/// configuration that benefits from extra refinement; with vanilla random
+/// init the marginal gain past iter 20 was negligible (stuck in local
+/// minima). All n rows are used (no sample cap), so each iter is one full
+/// O(N·K·d) sweep.
+pub const KMEANS_ITERS: usize = 40;
 
 pub const Header = extern struct {
     magic: u32,
@@ -180,18 +182,40 @@ pub inline fn label_at(bits: []const u64, row: u32) u1 {
 /// Force every page of the mmap'd dataset to be resident before any request
 /// is served. The eval target is a Mac Mini Late 2014 (HDD); a lazy page
 /// fault on rotational disk is ~5–10 ms wall, easily creating tail spikes
-/// inside the 2 min test window. Touch one byte per 4 KB page so the kernel
-/// faults all ~20K pages once, up-front. Best-effort `mlock` on Linux pins
-/// them so they can't be evicted under cgroup memory pressure.
+/// inside the 2 min test window. Best-effort `mlock` on Linux pins resident
+/// pages so they can't be evicted under cgroup memory pressure.
+///
+/// On Linux: `madvise(WILLNEED)` kicks off async readahead, then
+/// `madvise(POPULATE_READ)` (Linux 5.14+) does the prefault in-kernel —
+/// batched, fewer minor faults, larger I/Os than the per-page touch loop.
+/// On older kernels POPULATE_READ returns EINVAL and the touch loop below
+/// picks up the slack. The touch loop is also the only prefault mechanism
+/// on macOS (dev path).
 ///
 /// **No `madvise(MADV_RANDOM)`** — Phase 9.4 included it and regressed locally
 /// on macOS APFS (RANDOM disables readahead, which APFS uses aggressively).
-/// On Linux + HDD, omitting RANDOM keeps the kernel's default readahead
-/// behaviour during the touch loop, which is what we want.
+/// `WILLNEED` is different: it requests readahead rather than disabling it,
+/// so the APFS regression doesn't apply (and we gate it to Linux anyway).
 pub fn prefault_and_lock(blob: *const IvfQuantizedBlob) void {
     const bytes = blob.mapped.bytes;
     if (bytes.len == 0) return;
 
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        // MADV_POPULATE_READ landed in Linux 5.14; not yet in zig 0.16's
+        // std.os.linux.MADV. Hardcode the stable ABI value.
+        const MADV_POPULATE_READ: u32 = 22;
+        // madvise takes [*]u8; the mmap is PRIVATE+READ so the cast is
+        // kernel-side only (no actual write to the mapping).
+        const ptr = @constCast(bytes.ptr);
+        _ = linux.madvise(ptr, bytes.len, linux.MADV.WILLNEED);
+        _ = linux.madvise(ptr, bytes.len, MADV_POPULATE_READ);
+    }
+
+    // Cross-platform fallback: touch one byte per 4 KB page. On modern
+    // Linux this walks already-resident memory after POPULATE_READ — cheap
+    // (sequential RAM read of ~80 MB). On macOS / pre-5.14 Linux it's the
+    // mechanism that actually faults the pages in.
     var sink: u8 = 0;
     var off: usize = 0;
     while (off < bytes.len) : (off += 4096) {
@@ -201,8 +225,8 @@ pub fn prefault_and_lock(blob: *const IvfQuantizedBlob) void {
 
     if (comptime builtin.os.tag == .linux) {
         // mlock errors (EPERM from missing CAP_IPC_LOCK, ENOMEM from
-        // RLIMIT_MEMLOCK) are non-fatal — pages are still resident from the
-        // touch loop above. Pin only so the kernel's eviction policy
+        // RLIMIT_MEMLOCK) are non-fatal — pages are still resident from
+        // the steps above. Pin only so the kernel's eviction policy
         // doesn't reclaim them later under burst memory pressure.
         const linux = std.os.linux;
         _ = linux.mlock(bytes.ptr, bytes.len);
@@ -330,38 +354,19 @@ pub fn write(
     const n = ds.n;
     const n_u32: u32 = @intCast(n);
 
-    // 1. Draw a sample, run k-means.
-    const n_sample = @min(KMEANS_SAMPLE_CAP, n);
+    // 1. Run k-means over the full dataset (k-means++ init + Lloyd iters).
     const centroids = try allocator.alloc(f32, @as(usize, k_clusters) * N_FEATURES);
     defer allocator.free(centroids);
 
-    {
-        // Fisher-Yates the [0..n) row indices, take first n_sample.
-        var prng = std.Random.Xoshiro256.init(KMEANS_SEED ^ 0xc0ffee);
-        const rand = prng.random();
-        const all_idx = try allocator.alloc(u32, n);
-        defer allocator.free(all_idx);
-        for (0..n) |i| all_idx[i] = @intCast(i);
-        rand.shuffle(u32, all_idx);
-
-        const sample = try allocator.alloc(f32, N_FEATURES * n_sample);
-        defer allocator.free(sample);
-        for (0..N_FEATURES) |k| {
-            for (0..n_sample) |i| {
-                sample[k * n_sample + i] = ds.features[k * n + all_idx[i]];
-            }
-        }
-
-        try kmeans.run_kmeans(
-            allocator,
-            sample,
-            n_sample,
-            k_clusters,
-            KMEANS_ITERS,
-            KMEANS_SEED,
-            centroids,
-        );
-    }
+    try kmeans.run_kmeans(
+        allocator,
+        ds.features,
+        n,
+        k_clusters,
+        KMEANS_ITERS,
+        KMEANS_SEED,
+        centroids,
+    );
 
     // 2. Assign every row to its cluster.
     const assignments = try allocator.alloc(u32, n);
