@@ -98,18 +98,30 @@ pub fn warmup(iters: usize) void {
 /// Route table.
 ///   `GET  /ready`         → 200, empty body
 ///   `POST /fraud-score`   → vectorize → IVF top-5 → fraud-count → response[count]
+///   `GET  /__metrics`     → instrument report
 ///   anything else         → 404
-/// Vectorize errors → 400, keep_alive preserved.
+/// Routes have unique path lengths (6, 12, 10) → key the dispatch on
+/// `path.len` so the compiler emits one cmp + jump instead of three
+/// sequential `mem.eql` chains. Vectorize errors → 400, keep_alive preserved.
 pub fn dispatch(req: http.Request) http.Response {
-    if (req.method == .get and std.mem.eql(u8, req.path, "/ready")) {
-        return .{ .status = 200, .body = "", .content_type = "text/plain", .keep_alive = ka(req) };
-    }
-    if (req.method == .post and std.mem.eql(u8, req.path, "/fraud-score")) {
-        return handle_fraud_score(req);
-    }
-    if (req.method == .get and std.mem.eql(u8, req.path, "/__metrics")) {
-        const body = instrument.render(&metrics_buf);
-        return .{ .status = 200, .body = body, .content_type = "text/plain", .keep_alive = ka(req) };
+    switch (req.path.len) {
+        6 => {
+            if (req.method == .get and std.mem.eql(u8, req.path, "/ready")) {
+                return .{ .status = 200, .body = "", .content_type = "text/plain", .keep_alive = ka(req) };
+            }
+        },
+        12 => {
+            if (req.method == .post and std.mem.eql(u8, req.path, "/fraud-score")) {
+                return handle_fraud_score(req);
+            }
+        },
+        10 => {
+            if (req.method == .get and std.mem.eql(u8, req.path, "/__metrics")) {
+                const body = instrument.render(&metrics_buf);
+                return .{ .status = 200, .body = body, .content_type = "text/plain", .keep_alive = ka(req) };
+            }
+        },
+        else => {},
     }
     return .{ .status = 404, .body = "", .content_type = "text/plain", .keep_alive = ka(req) };
 }

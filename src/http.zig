@@ -84,6 +84,77 @@ fn header_value_eql_ci(value: []const u8, target_lower: []const u8) bool {
     return true;
 }
 
+/// Header-only parse for the streaming/recv path. Returns `null` when the
+/// header block (`\r\n\r\n`) isn't present yet — caller should wait for
+/// more bytes. On success returns method/path/keep_alive plus the byte
+/// offsets needed to slice the body (`headers_end`) and to know the total
+/// request size (`headers_end + content_length`).
+///
+/// The async backends (`http_async`, `http_uring`) used to call this twice
+/// per request — once via `sniff_content_length` to decide whether enough
+/// bytes had arrived, then again inside `parse` to build the `Request`.
+/// This unified helper does the header walk once; the caller assembles a
+/// `Request` literal once `total` bytes are available.
+pub const HeadersParsed = struct {
+    method: Method,
+    path: []const u8,
+    keep_alive: bool,
+    headers_end: usize,
+    content_length: usize,
+};
+
+pub fn parse_headers(bytes: []const u8) ParseError!?HeadersParsed {
+    const head_end = std.mem.indexOf(u8, bytes, "\r\n\r\n") orelse return null;
+    const headers_end = head_end + 4;
+
+    const first_crlf = std.mem.indexOf(u8, bytes, "\r\n").?;
+    const request_line = bytes[0..first_crlf];
+
+    const sp1 = std.mem.indexOfScalar(u8, request_line, ' ') orelse return error.Malformed;
+    const method_str = request_line[0..sp1];
+    const method: Method = blk: {
+        if (std.mem.eql(u8, method_str, "GET")) break :blk .get;
+        if (std.mem.eql(u8, method_str, "POST")) break :blk .post;
+        return error.UnsupportedMethod;
+    };
+
+    const after_method = request_line[sp1 + 1 ..];
+    const sp2 = std.mem.indexOfScalar(u8, after_method, ' ') orelse return error.Malformed;
+    const path = after_method[0..sp2];
+    const version = after_method[sp2 + 1 ..];
+    if (!std.mem.eql(u8, version, "HTTP/1.1")) return error.UnsupportedVersion;
+
+    var p: usize = first_crlf + 2;
+    var content_length: ?usize = null;
+    var keep_alive = true;
+    while (p < headers_end - 2) {
+        const line_end = std.mem.indexOfPos(u8, bytes, p, "\r\n") orelse return error.HeadersOversize;
+        if (line_end == p) break;
+        const colon = std.mem.indexOfScalarPos(u8, bytes, p, ':') orelse return error.Malformed;
+        if (colon >= line_end) return error.Malformed;
+        const name = bytes[p..colon];
+        var vstart: usize = colon + 1;
+        while (vstart < line_end and (bytes[vstart] == ' ' or bytes[vstart] == '\t')) vstart += 1;
+        const value = bytes[vstart..line_end];
+
+        if (header_name_eql(name, "content-length")) {
+            content_length = std.fmt.parseInt(usize, value, 10) catch return error.Malformed;
+        } else if (header_name_eql(name, "connection")) {
+            if (header_value_eql_ci(value, "close")) keep_alive = false;
+        }
+        p = line_end + 2;
+    }
+
+    const cl = content_length orelse if (method == .post) return error.MissingContentLength else 0;
+    return .{
+        .method = method,
+        .path = path,
+        .keep_alive = keep_alive,
+        .headers_end = headers_end,
+        .content_length = cl,
+    };
+}
+
 /// Parse a fully-buffered HTTP/1.1 request. All slices in the returned
 /// `Request` alias `bytes`; caller must keep `bytes` alive while using the
 /// request.

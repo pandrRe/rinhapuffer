@@ -129,17 +129,19 @@ var conns: [MAX_CONNS]Conn = undefined;
 var pbuf_storage: [PBUF_COUNT][PBUF_SIZE]u8 align(std.heap.page_size_min) = undefined;
 var pbuf_ring: *align(std.heap.page_size_min) linux.io_uring_buf_ring = undefined;
 
-// Set once by `run()`; read by callbacks. Single process per backend → safe.
-var dispatch_fn: http.Handler = undefined;
-
 pub const RunError = error{
     InitFailed,
     SubmitFailed,
     AcceptMultishotLost,
 };
 
-pub fn run(listen_fd: i32, dispatch: http.Handler) RunError!noreturn {
-    dispatch_fn = dispatch;
+pub fn run(listen_fd: i32, comptime dispatch: http.Handler) RunError!noreturn {
+    // `dispatch` is a comptime parameter so the compiler specializes every
+    // helper below for this exact handler — the call from `parse_loop`
+    // becomes a direct call, allowing inlining across parse → dispatch →
+    // vectorize → search → format. Removes the indirect-call cost (~1 ns
+    // + branch-predictor pollution) on every request and lets cross-fn
+    // optimizations fire.
 
     // Tail-latency tuning. SINGLE_ISSUER tells the kernel exactly one task
     // ever submits SQEs (true here — `run` is the only submitter), skipping
@@ -198,16 +200,16 @@ pub fn run(listen_fd: i32, dispatch: http.Handler) RunError!noreturn {
         while (true) {
             const n = ring.copy_cqes(&cqes, 0) catch return error.SubmitFailed;
             if (n == 0) break;
-            for (cqes[0..n]) |cqe| dispatch_cqe(&ring, listen_fd, cqe) catch |err| return err;
+            for (cqes[0..n]) |cqe| dispatch_cqe(&ring, listen_fd, cqe, dispatch) catch |err| return err;
         }
     }
 }
 
-fn dispatch_cqe(ring: *linux.IoUring, listen_fd: i32, cqe: linux.io_uring_cqe) RunError!void {
+fn dispatch_cqe(ring: *linux.IoUring, listen_fd: i32, cqe: linux.io_uring_cqe, comptime dispatch: http.Handler) RunError!void {
     switch (ud_op(cqe.user_data)) {
         OP_ACCEPT => try handle_accept(ring, listen_fd, cqe),
-        OP_RECV => try handle_recv(ring, cqe),
-        OP_WRITEV => try handle_writev(ring, cqe),
+        OP_RECV => try handle_recv(ring, cqe, dispatch),
+        OP_WRITEV => try handle_writev(ring, cqe, dispatch),
         OP_CLOSE => handle_close(cqe),
         else => {},
     }
@@ -290,7 +292,7 @@ fn submit_recv(ring: *linux.IoUring, slot: u16) !void {
     conn.recv_armed = true;
 }
 
-fn handle_recv(ring: *linux.IoUring, cqe: linux.io_uring_cqe) RunError!void {
+fn handle_recv(ring: *linux.IoUring, cqe: linux.io_uring_cqe, comptime dispatch: http.Handler) RunError!void {
     const slot = ud_slot(cqe.user_data);
     if (slot >= MAX_CONNS) return;
     const conn = &conns[slot];
@@ -342,7 +344,7 @@ fn handle_recv(ring: *linux.IoUring, cqe: linux.io_uring_cqe) RunError!void {
     linux.IoUring.buf_ring_add(pbuf_ring, pbuf_storage[buf_id][0..], buf_id, PBUF_MASK, 0);
     linux.IoUring.buf_ring_advance(pbuf_ring, 1);
 
-    parse_loop(ring, slot) catch return error.SubmitFailed;
+    parse_loop(ring, slot, dispatch) catch return error.SubmitFailed;
 
     // If the multishot terminated (F_MORE was clear) and we're still alive
     // with room, re-arm. Otherwise the kernel keeps streaming — no SQE.
@@ -357,28 +359,36 @@ fn handle_recv(ring: *linux.IoUring, cqe: linux.io_uring_cqe) RunError!void {
 
 // ─── parse + dispatch ──────────────────────────────────────────────────────
 
-fn parse_loop(ring: *linux.IoUring, slot: u16) !void {
+fn parse_loop(ring: *linux.IoUring, slot: u16, comptime dispatch: http.Handler) !void {
     const conn = &conns[slot];
     while (conn.state == .normal and !conn.write_in_flight) {
-        const head_end_opt = std.mem.indexOf(u8, conn.read_buf[0..conn.have], "\r\n\r\n");
-        const head_end = head_end_opt orelse return;
-        const headers_end = head_end + 4;
-
-        const cl = sniff_content_length(conn.read_buf[0..headers_end]);
-        const total = headers_end + cl;
+        // Single header walk: returns null when \r\n\r\n isn't here yet,
+        // otherwise yields method/path/keep_alive + the offsets we need
+        // to size the body. Replaces the old `indexOf+sniff+parse` triple.
+        const hp = http.parse_headers(conn.read_buf[0..conn.have]) catch |err| {
+            instrument.inc(&instrument.req_parse_err, 1);
+            try send_status_close(ring, slot, map_parse_status(err));
+            return;
+        } orelse return;
+        const total = hp.headers_end + hp.content_length;
         if (total > READ_BUF_SIZE) {
             try send_status_close(ring, slot, 413);
             return;
         }
         if (total > conn.have) return; // need more bytes
 
-        const req = http.parse(conn.read_buf[0..total]) catch |err| {
-            instrument.inc(&instrument.req_parse_err, 1);
-            try send_status_close(ring, slot, map_parse_status(err));
-            return;
+        const body: []const u8 = if (hp.method == .post)
+            conn.read_buf[hp.headers_end..total]
+        else
+            "";
+        const req: http.Request = .{
+            .method = hp.method,
+            .path = hp.path,
+            .body = body,
+            .keep_alive = hp.keep_alive,
         };
 
-        const resp = dispatch_fn(req);
+        const resp = dispatch(req);
 
         const head_slice: []const u8 = if (http.fast_head(resp)) |fh| blk: {
             instrument.inc(&instrument.head_fast, 1);
@@ -442,7 +452,7 @@ fn submit_writev(ring: *linux.IoUring, slot: u16) !void {
     conn.write_in_flight = true;
 }
 
-fn handle_writev(ring: *linux.IoUring, cqe: linux.io_uring_cqe) RunError!void {
+fn handle_writev(ring: *linux.IoUring, cqe: linux.io_uring_cqe, comptime dispatch: http.Handler) RunError!void {
     const slot = ud_slot(cqe.user_data);
     if (slot >= MAX_CONNS) return;
     const conn = &conns[slot];
@@ -470,7 +480,7 @@ fn handle_writev(ring: *linux.IoUring, cqe: linux.io_uring_cqe) RunError!void {
         return;
     }
     // Try to dispatch the next pipelined request.
-    parse_loop(ring, slot) catch return error.SubmitFailed;
+    parse_loop(ring, slot, dispatch) catch return error.SubmitFailed;
     // Re-arm recv if room and no recv pending.
     if (conn.state == .normal and !conn.recv_armed and conn.have < READ_BUF_SIZE) {
         submit_recv(ring, slot) catch return error.SubmitFailed;
@@ -554,40 +564,6 @@ fn send_status_close(ring: *linux.IoUring, slot: u16, status: u16) !void {
 }
 
 // ─── parse helpers ──────────────────────────────────────────────────────────
-// TODO(M6): dedup with `http_async.zig:410-447` — both backends use the same
-// helpers verbatim. Move into `http.zig` once the io_uring path is the proven
-// default.
-
-fn sniff_content_length(headers: []const u8) usize {
-    var p: usize = std.mem.indexOf(u8, headers, "\r\n").? + 2;
-    while (p + 2 < headers.len) {
-        const line_end = std.mem.indexOfPos(u8, headers, p, "\r\n").?;
-        if (line_end == p) break;
-        const colon = std.mem.indexOfScalarPos(u8, headers, p, ':') orelse {
-            p = line_end + 2;
-            continue;
-        };
-        if (colon < line_end) {
-            const name = headers[p..colon];
-            if (name_eql_ci(name, "content-length")) {
-                var vstart = colon + 1;
-                while (vstart < line_end and (headers[vstart] == ' ' or headers[vstart] == '\t')) vstart += 1;
-                return std.fmt.parseInt(usize, headers[vstart..line_end], 10) catch 0;
-            }
-        }
-        p = line_end + 2;
-    }
-    return 0;
-}
-
-fn name_eql_ci(name: []const u8, target_lower: []const u8) bool {
-    if (name.len != target_lower.len) return false;
-    for (name, target_lower) |a, b| {
-        const al = if (a >= 'A' and a <= 'Z') a + 32 else a;
-        if (al != b) return false;
-    }
-    return true;
-}
 
 fn map_parse_status(err: http.ParseError) u16 {
     return switch (err) {
@@ -632,21 +608,6 @@ test "advance_write: spans head and body in one call" {
     advance_write(&conn, 5); // 3 head + 2 body
     try std.testing.expectEqual(@as(u8, 1), conn.write_iov_idx);
     try std.testing.expectEqual(@as(usize, 4), conn.write_iovs[1].len);
-}
-
-test "sniff_content_length — present" {
-    const headers = "POST /x HTTP/1.1\r\nContent-Length: 42\r\nHost: y\r\n\r\n";
-    try std.testing.expectEqual(@as(usize, 42), sniff_content_length(headers));
-}
-
-test "sniff_content_length — case-insensitive" {
-    const headers = "POST /x HTTP/1.1\r\ncontent-length:  17\r\n\r\n";
-    try std.testing.expectEqual(@as(usize, 17), sniff_content_length(headers));
-}
-
-test "sniff_content_length — absent" {
-    const headers = "GET /x HTTP/1.1\r\nHost: y\r\n\r\n";
-    try std.testing.expectEqual(@as(usize, 0), sniff_content_length(headers));
 }
 
 test "map_parse_status — 400 vs 413" {
