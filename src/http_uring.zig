@@ -109,6 +109,11 @@ const Conn = struct {
     write_iovs: [2]posix.iovec_const,
     write_iov_idx: u8,
     write_keep_alive: bool,
+    // The iovec slice the kernel reads from while the WRITEV is in flight.
+    // Must outlive the SQE submission — io_uring stores the pointer in the
+    // SQE and the kernel dereferences it asynchronously. Stack-local would
+    // race under concurrent load.
+    submit_iovs: [2]posix.iovec_const,
 };
 
 // Conn slot is identified directly by the kernel-allocated registered-file
@@ -233,6 +238,10 @@ fn handle_accept(ring: *linux.IoUring, listen_fd: i32, cqe: linux.io_uring_cqe) 
             },
             .write_iov_idx = 2,
             .write_keep_alive = true,
+            .submit_iovs = .{
+                .{ .base = undefined, .len = 0 },
+                .{ .base = undefined, .len = 0 },
+            },
         };
 
         submit_recv(ring, slot) catch return error.SubmitFailed;
@@ -394,23 +403,27 @@ fn advance_read(conn: *Conn, consumed: usize) void {
 
 fn submit_writev(ring: *linux.IoUring, slot: u16) !void {
     const conn = &conns[slot];
-    var iov_buf: [2]posix.iovec_const = undefined;
+    // The iovec backing storage MUST outlive the SQE — io_uring captures the
+    // pointer and dereferences it asynchronously. Use the per-conn
+    // `submit_iovs` field, not a stack-local: under concurrent load the
+    // stack frame would be reused before the kernel reads it, corrupting
+    // the iovec and emitting a garbled head/body on the wire.
     var iov_count: usize = 0;
     if (conn.write_iov_idx == 0) {
-        iov_buf[0] = conn.write_iovs[0];
+        conn.submit_iovs[0] = conn.write_iovs[0];
         iov_count = 1;
         if (conn.write_iovs[1].len > 0) {
-            iov_buf[1] = conn.write_iovs[1];
+            conn.submit_iovs[1] = conn.write_iovs[1];
             iov_count = 2;
         }
     } else if (conn.write_iov_idx == 1) {
-        iov_buf[0] = conn.write_iovs[1];
+        conn.submit_iovs[0] = conn.write_iovs[1];
         iov_count = 1;
     } else {
         return; // already drained
     }
     const ud = make_user_data(slot, OP_WRITEV, conn.generation);
-    const sqe = try ring.writev(ud, @intCast(slot), iov_buf[0..iov_count], 0);
+    const sqe = try ring.writev(ud, @intCast(slot), conn.submit_iovs[0..iov_count], 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     conn.write_in_flight = true;
 }
