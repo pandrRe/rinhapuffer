@@ -104,14 +104,38 @@ pub fn euclidean_topk_q_ivf(
     std.debug.assert(qds.k_clusters <= MAX_K_CLUSTERS);
     std.debug.assert(qds.k_clusters >= PROBE_CLUSTERS);
 
-    // Step 1: SIMD centroid distances (one @Vector(14, f32) per cluster).
+    var q_int: [N_FEATURES]i16 = undefined;
+    quantize_query(q, &q_int);
+
+    // Step 1 (combined): per cluster, compute centroid distance² AND bbox
+    // lower-bound² in the same loop. Both metadata regions (centroids 56KB,
+    // bbox_lo+hi 56KB) are L2-resident and prefetched as the loop streams.
+    // Storing the LB² values means the post-probe repair pass at the bottom
+    // is a pure L1 lookup against `lb_sq[c]` — no re-fetching bbox lines
+    // after step 2's block scans evict them.
     var centroid_dists: [MAX_K_CLUSTERS]f32 = undefined;
+    var lb_sq: [MAX_K_CLUSTERS]i64 = undefined;
     const Vf = @Vector(N_FEATURES, f32);
-    const qv: Vf = q.*;
+    const Vi16N = @Vector(N_FEATURES, i16);
+    const Vi32N = @Vector(N_FEATURES, i32);
+    const Vi64N = @Vector(N_FEATURES, i64);
+    const qv_f: Vf = q.*;
+    const qv_i32: Vi32N = @as(Vi16N, q_int);
+    const zero_i32: Vi32N = @splat(0);
     for (0..qds.k_clusters) |c| {
         const cv: Vf = qds.centroids[c * N_FEATURES ..][0..N_FEATURES].*;
-        const diff = qv - cv;
+        const diff = qv_f - cv;
         centroid_dists[c] = @reduce(.Add, diff * diff);
+
+        const lo: Vi16N = qds.bbox_lo[c * N_FEATURES ..][0..N_FEATURES].*;
+        const hi: Vi16N = qds.bbox_hi[c * N_FEATURES ..][0..N_FEATURES].*;
+        const lo_i32: Vi32N = lo;
+        const hi_i32: Vi32N = hi;
+        const below_lo: Vi32N = lo_i32 - qv_i32;
+        const above_hi: Vi32N = qv_i32 - hi_i32;
+        const d: Vi32N = @max(zero_i32, @max(below_lo, above_hi));
+        const d_i64: Vi64N = d;
+        lb_sq[c] = @reduce(.Add, d_i64 * d_i64);
     }
 
     // Step 2: select PROBE clusters with smallest centroid distance via a
@@ -141,9 +165,6 @@ pub fn euclidean_topk_q_ivf(
     // We mark probed clusters by overwriting their centroid_dists with +inf
     // so the bbox-prune pass below skips them via a single `< inf` compare —
     // no separate `in_probe` bitset (saves 1 KiB stack + a write per probe).
-    var q_int: [N_FEATURES]i16 = undefined;
-    quantize_query(q, &q_int);
-
     var top_dists: [TOP_K]i64 = @splat(std.math.maxInt(i64));
     var top_rows: [TOP_K]u32 = @splat(0);
 
@@ -153,8 +174,7 @@ pub fn euclidean_topk_q_ivf(
     inline for (1..PROBE_CLUSTERS) |i| {
         const c = probe_idxs[i];
         centroid_dists[c] = std.math.inf(f32);
-        const lb = bbox_lower_bound_sq(&q_int, qds.bbox_lo, qds.bbox_hi, c);
-        if (lb < top_dists[0]) {
+        if (lb_sq[c] < top_dists[0]) {
             scan_cluster_blocks(qds, c, &q_int, &top_dists, &top_rows);
             instrument.inc(&instrument.search_clusters_probed, 1);
         } else {
@@ -163,8 +183,7 @@ pub fn euclidean_topk_q_ivf(
     }
     for (0..qds.k_clusters) |c| {
         if (centroid_dists[c] == std.math.inf(f32)) continue;
-        const lb = bbox_lower_bound_sq(&q_int, qds.bbox_lo, qds.bbox_hi, c);
-        if (lb >= top_dists[0]) {
+        if (lb_sq[c] >= top_dists[0]) {
             instrument.inc(&instrument.search_clusters_bbox_skipped, 1);
             continue;
         }
@@ -173,39 +192,6 @@ pub fn euclidean_topk_q_ivf(
     }
 
     inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
-}
-
-/// Axis-aligned squared distance from query to cluster `c`'s bounding box.
-/// Per feature, contributes `(below_lo)²` if `q < lo`, `(above_hi)²` if
-/// `q > hi`, else 0. SIMD across all 14 features in one shot —
-/// `@Vector(N_FEATURES, ·)` lanes get padded to 16 by LLVM on aarch64
-/// (4× int32x4 ops), no waste of meaningful work.
-inline fn bbox_lower_bound_sq(
-    q_int: *const [N_FEATURES]i16,
-    bbox_lo: []const i16,
-    bbox_hi: []const i16,
-    c: usize,
-) i64 {
-    const Vi16N = @Vector(N_FEATURES, i16);
-    const Vi32N = @Vector(N_FEATURES, i32);
-    const Vi64N = @Vector(N_FEATURES, i64);
-
-    const lo: Vi16N = bbox_lo[c * N_FEATURES ..][0..N_FEATURES].*;
-    const hi: Vi16N = bbox_hi[c * N_FEATURES ..][0..N_FEATURES].*;
-    const qv: Vi16N = q_int.*;
-
-    const lo_i32: Vi32N = lo;
-    const hi_i32: Vi32N = hi;
-    const qv_i32: Vi32N = qv;
-
-    const below_lo: Vi32N = lo_i32 - qv_i32;
-    const above_hi: Vi32N = qv_i32 - hi_i32;
-    const zero: Vi32N = @splat(0);
-    const d: Vi32N = @max(zero, @max(below_lo, above_hi));
-
-    const d_i64: Vi64N = d;
-    const sq: Vi64N = d_i64 * d_i64;
-    return @reduce(.Add, sq);
 }
 
 // ─── block-SoA cluster scan (production IVF inner loop) ──────────────────
