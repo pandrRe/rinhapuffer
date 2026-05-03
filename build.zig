@@ -51,10 +51,17 @@ pub fn build(b: *std.Build) void {
     // `false` → epoll (`http_async.zig`). Both branches comptime-resolved in
     // `main.zig`; only the selected backend is linked.
     const use_uring = b.option(bool, "uring", "Use io_uring HTTP backend on Linux (default: true)") orelse true;
+    // SQPOLL kernel polling thread on the SQ ring — io_uring_enter is no
+    // longer needed in steady state. Burns one CPU when active; off-limits
+    // under our 0.35 cpu container budget but useful as a local-only
+    // experiment. Incompatible with DEFER_TASKRUN; we swap the flag combo
+    // when this is set. Default off.
+    const sqpoll = b.option(bool, "sqpoll", "Enable IORING_SETUP_SQPOLL on the io_uring backend (default: false)") orelse false;
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "keep_alive", keep_alive);
     build_opts.addOption(bool, "instrument", instrument);
     build_opts.addOption(bool, "use_uring", use_uring);
+    build_opts.addOption(bool, "sqpoll", sqpoll);
     // Materialize the build_options module once and share it across the
     // library and exe modules — calling `addOptions` on each module would
     // mint two distinct modules and zig would refuse the duplicate-source.

@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const http = @import("http.zig");
 const instrument = @import("instrument.zig");
 
@@ -149,12 +150,24 @@ pub fn run(listen_fd: i32, comptime dispatch: http.Handler) RunError!noreturn {
     // next io_uring_enter instead of running it inline at completion time,
     // which cuts wakeup churn on multishot CQEs. COOP_TASKRUN avoids inter-
     // processor interrupts when the kernel posts CQEs from another core.
-    // All three need 5.19+ (DEFER_TASKRUN requires 6.1; gracefully fall back
-    // if the kernel rejects the combo).
+    //
+    // SQPOLL alternative (build with `-Dsqpoll=true`): kernel spawns a poller
+    // thread that drains the SQ ring without `io_uring_enter`, eliminating
+    // the per-loop-tick syscall entirely. Steady-state cost is ~one core
+    // burned. Mutually exclusive with DEFER_TASKRUN (DEFER_TASKRUN requires
+    // the issuer to drain task-work via enter; SQPOLL bypasses that). We
+    // also push the idle window to 2 ms so brief gaps don't park the poller.
     var params: linux.io_uring_params = std.mem.zeroes(linux.io_uring_params);
-    params.flags = linux.IORING_SETUP_SINGLE_ISSUER |
-        linux.IORING_SETUP_DEFER_TASKRUN |
-        linux.IORING_SETUP_COOP_TASKRUN;
+    if (comptime build_options.sqpoll) {
+        params.flags = linux.IORING_SETUP_SQPOLL |
+            linux.IORING_SETUP_SINGLE_ISSUER |
+            linux.IORING_SETUP_COOP_TASKRUN;
+        params.sq_thread_idle = 2_000;
+    } else {
+        params.flags = linux.IORING_SETUP_SINGLE_ISSUER |
+            linux.IORING_SETUP_DEFER_TASKRUN |
+            linux.IORING_SETUP_COOP_TASKRUN;
+    }
     var ring = linux.IoUring.init_params(SQ_DEPTH, &params) catch blk: {
         // Older kernel rejected the flag combo. Retry with no flags.
         params = std.mem.zeroes(linux.io_uring_params);

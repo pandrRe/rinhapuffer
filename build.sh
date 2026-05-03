@@ -82,7 +82,15 @@ if [ -n "${INSTRUMENT:-}" ]; then
     # bottleneck analysis only — do NOT submit/eval with this.
     INSTRUMENT_FLAG="-Dinstrument=true"
 fi
-zig build -Doptimize=ReleaseFast -Dtarget="${ZIG_TARGET}" -Dkeep-alive=true ${CPU_FLAG} ${INSTRUMENT_FLAG}
+SQPOLL_FLAG=""
+if [ -n "${SQPOLL:-}" ]; then
+    # SQPOLL: kernel-side SQ ring polling thread; eliminates io_uring_enter
+    # in steady state at the cost of one core. Use for local experiments;
+    # under our 0.35 cpu container cap the poller will compete with the
+    # request handler.
+    SQPOLL_FLAG="-Dsqpoll=true"
+fi
+zig build -Doptimize=ReleaseFast -Dtarget="${ZIG_TARGET}" -Dkeep-alive=true ${CPU_FLAG} ${INSTRUMENT_FLAG} ${SQPOLL_FLAG}
 
 echo
 echo "==> artifacts"
@@ -98,6 +106,9 @@ fi
 LOCAL_TAG_SUFFIX="${TARGET_ARCH}"
 if [ -n "${INSTRUMENT:-}" ]; then
     LOCAL_TAG_SUFFIX="${TARGET_ARCH}-instrument"
+fi
+if [ -n "${SQPOLL:-}" ]; then
+    LOCAL_TAG_SUFFIX="${LOCAL_TAG_SUFFIX}-sqpoll"
 fi
 LOCAL_TAG="localhost/rinhapuffer:${LOCAL_TAG_SUFFIX}"
 echo

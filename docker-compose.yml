@@ -1,6 +1,13 @@
 services:
   lb:
     image: haproxy:3.0-alpine
+    # `-db` = foreground, single-process. Override the image entrypoint
+    # (which prepends `-W` for master-worker mode) so haproxy runs as a
+    # single PID 1 process — saves the master watchdog (~8 MB RSS) and
+    # one fork. Docker's restart policy stands in for the crash-restart
+    # that the master would have provided. We don't need SIGUSR2 reload
+    # during the eval window.
+    entrypoint: ["haproxy", "-db", "-f", "/usr/local/etc/haproxy/haproxy.cfg"]
     ports:
       - "9999:9999"
     volumes:
