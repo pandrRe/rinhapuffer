@@ -12,6 +12,7 @@ pub const dataset_blob = @import("dataset_blob.zig");
 pub const kmeans = @import("kmeans.zig");
 pub const http = @import("http.zig");
 pub const handler = @import("handler.zig");
+pub const instrument = @import("instrument.zig");
 // http_async is Linux-only (epoll). On other targets we expose an empty
 // namespace so this module still compiles; main.zig comptime-branches the
 // call site so the empty namespace is never used on Mac/etc.
@@ -26,5 +27,6 @@ test {
     _ = kmeans;
     _ = http;
     _ = handler;
+    _ = instrument;
     if (builtin.os.tag == .linux) _ = http_async;
 }

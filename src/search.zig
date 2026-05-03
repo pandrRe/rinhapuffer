@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const transform_reference = @import("transform_reference.zig");
+const instrument = @import("instrument.zig");
 
 pub const N_FEATURES: usize = transform_reference.N_FEATURES;
 pub const TOP_K: usize = 5;
@@ -148,19 +149,27 @@ pub fn euclidean_topk_q_ivf(
 
     centroid_dists[probe_idxs[0]] = std.math.inf(f32);
     scan_cluster_blocks(qds, probe_idxs[0], &q_int, &top_dists, &top_rows);
+    instrument.inc(&instrument.search_clusters_probed, 1);
     inline for (1..PROBE_CLUSTERS) |i| {
         const c = probe_idxs[i];
         centroid_dists[c] = std.math.inf(f32);
         const lb = bbox_lower_bound_sq(&q_int, qds.bbox_lo, qds.bbox_hi, c);
         if (lb < top_dists[0]) {
             scan_cluster_blocks(qds, c, &q_int, &top_dists, &top_rows);
+            instrument.inc(&instrument.search_clusters_probed, 1);
+        } else {
+            instrument.inc(&instrument.search_clusters_bbox_skipped, 1);
         }
     }
     for (0..qds.k_clusters) |c| {
         if (centroid_dists[c] == std.math.inf(f32)) continue;
         const lb = bbox_lower_bound_sq(&q_int, qds.bbox_lo, qds.bbox_hi, c);
-        if (lb >= top_dists[0]) continue;
+        if (lb >= top_dists[0]) {
+            instrument.inc(&instrument.search_clusters_bbox_skipped, 1);
+            continue;
+        }
         scan_cluster_blocks(qds, c, &q_int, &top_dists, &top_rows);
+        instrument.inc(&instrument.search_clusters_bbox_scanned, 1);
     }
 
     inline for (0..TOP_K) |i| out[i] = top_rows[TOP_K - 1 - i];
@@ -223,6 +232,7 @@ inline fn scan_cluster_blocks(
 
     var b: usize = block_start;
     while (b < block_end) : (b += 1) {
+        instrument.inc(&instrument.search_blocks_scanned, 1);
         const block_base = b * stride;
         if (b + 1 < block_end) {
             @prefetch(&qds.block_features[(b + 1) * stride], .{ .locality = 1 });
@@ -251,7 +261,10 @@ inline fn scan_cluster_blocks(
             const sq: BVi32 = diff_i32 * diff_i32;
             dist += @as(BVi64, sq);
         }
-        if (@reduce(.Min, dist) > top_dists[0]) continue;
+        if (@reduce(.Min, dist) > top_dists[0]) {
+            instrument.inc(&instrument.search_blocks_early_pruned, 1);
+            continue;
+        }
         inline for (EARLY_OUT_AT..N_FEATURES) |k| {
             const r_i16: BVi16 = qds.block_features[block_base + k * BLOCK_W ..][0..BLOCK_W].*;
             const diff_i16: BVi16 = q_vec[k] - r_i16;
@@ -274,6 +287,7 @@ inline fn scan_cluster_blocks(
                 const d = dist[lane];
                 const r = lane_row_base + @as(u32, @intCast(lane));
                 if (better_pair_i64(d, r, top_dists[0], top_rows[0])) {
+                    instrument.inc(&instrument.search_sift_ins, 1);
                     sift_in_min_i64(top_dists, top_rows, d, r);
                 }
             }

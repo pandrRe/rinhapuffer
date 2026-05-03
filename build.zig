@@ -43,8 +43,13 @@ pub fn build(b: *std.Build) void {
     // back on with `zig build -Dkeep-alive=true` if connect-per-request
     // overhead matters more than fairness in your scenario.
     const keep_alive = b.option(bool, "keep-alive", "Honour HTTP/1.1 keep-alive on responses (default: false)") orelse false;
+    // Instrumentation: per-stage histograms + search counters surfaced via
+    // GET /__metrics. Default off — every callsite is comptime-gated to a
+    // no-op so prod ships zero overhead. Flip with `-Dinstrument=true`.
+    const instrument = b.option(bool, "instrument", "Enable hot-path instrumentation + /__metrics (default: false)") orelse false;
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "keep_alive", keep_alive);
+    build_opts.addOption(bool, "instrument", instrument);
 
     const mod = b.addModule("rinhapuffer", .{
         // The root source file is the "entry point" of this module. Users of
@@ -92,8 +97,11 @@ pub fn build(b: *std.Build) void {
         // auto-linked; on cross-compile targets (musl) we must opt in.
         .link_libc = true,
         // No DWARF in the shipped binary — runtime image is `scratch`, no
-        // stacktrace consumer anyway, and stripping cuts ~3.5 MB.
-        .strip = if (optimize == .Debug) null else true,
+        // stacktrace consumer anyway, and stripping cuts ~3.5 MB. Instrument
+        // builds keep DWARF + frame pointers so `perf record -g` resolves
+        // stacks against source.
+        .strip = if (optimize == .Debug or instrument) null else true,
+        .omit_frame_pointer = if (instrument) false else null,
         // List of modules available for import in source files part of the
         // root module.
         .imports = &.{

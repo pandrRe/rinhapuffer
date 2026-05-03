@@ -19,6 +19,7 @@ const http = @import("http.zig");
 const payload = @import("payload.zig");
 const search = @import("search.zig");
 const dataset_blob = @import("dataset_blob.zig");
+const instrument = @import("instrument.zig");
 
 const N_FEATURES = payload.N_FEATURES;
 const TOP_K = search.TOP_K;
@@ -29,6 +30,13 @@ var blob: ?dataset_blob.IvfQuantizedBlob = null;
 // Per-request scratch. Single-threaded server → safe to share.
 var q_buf: [N_FEATURES]f32 = undefined;
 var top_rows: [TOP_K]u32 = undefined;
+
+// Backing buffer for the /__metrics text response. Module-level → outlives
+// the dispatch return so the response body slice stays valid through the
+// epoll write drain. Single-threaded server → safe to share. Only written
+// when instrument is enabled; in non-instrument builds the helper returns
+// a tiny static "off" message so the buffer is unused but cheap.
+var metrics_buf: [instrument.REPORT_BUF_SIZE]u8 = undefined;
 
 // Keep-alive policy is a comptime decision driven by the `-Dkeep-alive` build
 // option. Default off — k6 ramping load showed that honouring keep-alive head-
@@ -99,15 +107,27 @@ pub fn dispatch(req: http.Request) http.Response {
     if (req.method == .post and std.mem.eql(u8, req.path, "/fraud-score")) {
         return handle_fraud_score(req);
     }
+    if (req.method == .get and std.mem.eql(u8, req.path, "/__metrics")) {
+        const body = instrument.render(&metrics_buf);
+        return .{ .status = 200, .body = body, .content_type = "text/plain", .keep_alive = ka(req) };
+    }
     return .{ .status = 404, .body = "", .content_type = "text/plain", .keep_alive = ka(req) };
 }
 
 fn handle_fraud_score(req: http.Request) http.Response {
+    instrument.inc(&instrument.req_total, 1);
+
+    const t_vec = instrument.now_ns();
     payload.vectorize(req.body, &q_buf) catch {
+        instrument.inc(&instrument.req_vectorize_err, 1);
         return .{ .status = 400, .body = "", .content_type = "text/plain", .keep_alive = ka(req) };
     };
+    instrument.observe_since(&instrument.hist_vectorize, t_vec);
+
     const qds = blob.?.dataset;
+    const t_search = instrument.now_ns();
     search.euclidean_topk_q_ivf(qds, &q_buf, &top_rows);
+    instrument.observe_since(&instrument.hist_search, t_search);
 
     var fraud_count: u8 = 0;
     inline for (0..TOP_K) |i| {

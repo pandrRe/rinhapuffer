@@ -1,0 +1,30 @@
+# Instrument-mode override. Compose on top of the base file:
+#
+#   INSTRUMENT=1 IMAGE=1 ./build.sh
+#   docker compose -f docker-compose.yml -f docker-compose.instrument.yml up
+#
+# Differences from the base stack:
+#   - api1/api2 use the localhost/rinhapuffer:<arch>-instrument image
+#     (DWARF + frame pointers + /__metrics, ~5 MB vs 400 KB).
+#   - nginx mounts infra/nginx.instrument.conf, exposing /__metrics-1 and
+#     /__metrics-2 routes pinned to each backend, plus the usual /fraud-score
+#     round-robin.
+#   - Resource caps stay at the spec totals — instrumentation adds ~250 ns
+#     per request, which is what /__metrics samples reflect.
+#
+# perf workflow (run on the host, not inside the container):
+#   PID=$(docker inspect -f '{{.State.Pid}}' rinhapuffer-api1-1)
+#   sudo perf record -F 999 -g --call-graph dwarf -p $PID -- sleep 30
+#   sudo perf report --no-children --stdio --symfs=/proc/$PID/root | head -60
+
+services:
+  lb:
+    volumes:
+      - ./infra/nginx.instrument.conf:/etc/nginx/nginx.conf:ro
+      - sockets:/sockets
+
+  api1:
+    image: ${RINHAPUFFER_IMAGE:-localhost/rinhapuffer:amd64-instrument}
+
+  api2:
+    image: ${RINHAPUFFER_IMAGE:-localhost/rinhapuffer:amd64-instrument}

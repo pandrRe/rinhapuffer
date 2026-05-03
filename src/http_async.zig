@@ -10,6 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const http = @import("http.zig");
+const instrument = @import("instrument.zig");
 
 comptime {
     if (builtin.os.tag != .linux) {
@@ -85,6 +86,7 @@ pub fn run(listen_fd: i32, dispatch: http.Handler) RunError!noreturn {
     }
 
     pool_reset();
+    instrument.init();
 
     var events: [EVENTS_PER_WAIT]linux.epoll_event = undefined;
     while (true) {
@@ -96,6 +98,8 @@ pub fn run(listen_fd: i32, dispatch: http.Handler) RunError!noreturn {
             return error.EpollWaitFailed;
         }
         const n: usize = @intCast(wait_signed);
+        instrument.inc(&instrument.epoll_wakeups, 1);
+        instrument.inc(&instrument.epoll_events, @intCast(n));
 
         for (events[0..n]) |ev| {
             if (ev.data.u64 == LISTEN_TAG) {
@@ -184,6 +188,7 @@ fn accept_loop(epfd: i32, listen_fd: i32) void {
             .write_off = 0,
             .write_keep_alive = true,
         };
+        instrument.inc(&instrument.accepts, 1);
 
         // Always-armed: register IN | OUT | ET once. ET only delivers
         // events on transitions, so an idle conn with nothing to write
@@ -208,6 +213,7 @@ fn close_conn(epfd: i32, idx: u16) void {
     _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, conn.fd, null);
     _ = linux.close(conn.fd);
     pool_free(idx);
+    instrument.inc(&instrument.conn_closes, 1);
 }
 
 // Always-armed EPOLLIN|EPOLLOUT|ET (set once at accept). State transitions
@@ -242,10 +248,14 @@ fn try_read_and_dispatch(epfd: i32, idx: u16) void {
             }
             if (total > conn.have) break; // wait for more bytes
 
+            const t_total = instrument.now_ns();
+            const t_parse = instrument.now_ns();
             const req = http.parse(conn.read_buf[0..total]) catch |err| {
+                instrument.inc(&instrument.req_parse_err, 1);
                 send_status_close(epfd, idx, map_parse_status(err));
                 return;
             };
+            instrument.observe_since(&instrument.hist_parse, t_parse);
 
             const resp = dispatch_fn(req);
 
@@ -254,25 +264,31 @@ fn try_read_and_dispatch(epfd: i32, idx: u16) void {
             // bufPrint-based slow path.
             if (http.fast_head(resp)) |fh| {
                 conn.write_head = fh;
+                instrument.inc(&instrument.head_fast, 1);
             } else {
                 const head = http.format_head(&conn.head_buf, resp) catch {
                     close_conn(epfd, idx);
                     return;
                 };
                 conn.write_head = head;
+                instrument.inc(&instrument.head_slow, 1);
             }
             conn.write_body = resp.body;
             conn.write_off = 0;
             conn.write_keep_alive = resp.keep_alive;
 
+            const t_write = instrument.now_ns();
             if (!try_drain_write_inner(conn)) {
                 // Partial write → wait for OUT. Advance read buffer first so
                 // any subsequent buffered request waits behind this write.
                 advance_read(conn, total);
                 conn.state = .writing;
                 rearm(epfd, conn.fd, idx, true);
+                instrument.inc(&instrument.partial_writes, 1);
                 return;
             }
+            instrument.observe_since(&instrument.hist_write, t_write);
+            instrument.observe_since(&instrument.hist_total, t_total);
             if (!resp.keep_alive) {
                 close_conn(epfd, idx);
                 return;
@@ -294,6 +310,7 @@ fn try_read_and_dispatch(epfd: i32, idx: u16) void {
         if (signed < 0) {
             const errno_raw: u32 = @intCast(-signed);
             if (errno_raw == @intFromEnum(linux.E.AGAIN)) {
+                instrument.inc(&instrument.read_eagain, 1);
                 return; // drained — wait for next IN edge
             }
             close_conn(epfd, idx);
@@ -351,6 +368,7 @@ fn try_drain_write_inner(conn: *Conn) bool {
         if (signed < 0) {
             const errno_raw: u32 = @intCast(-signed);
             if (errno_raw == @intFromEnum(linux.E.AGAIN)) {
+                instrument.inc(&instrument.write_eagain, 1);
                 return false;
             }
             // Real error — we report not-drained; caller's outer logic will

@@ -14,6 +14,8 @@
 #   TARGET_ARCH=arm64 ./build.sh          # native arm64 (fast local podman dev)
 #   SKIP_PREP=1 ./build.sh                # reuse existing resources/dataset.bin
 #   IMAGE=1 ./build.sh                    # also `podman build` the image
+#   INSTRUMENT=1 IMAGE=1 ./build.sh       # /__metrics + DWARF; image tag
+#                                         # localhost/rinhapuffer:<arch>-instrument
 #   PUSH=1 GHCR_USER=pedroandre9877 ./build.sh
 #                                         # build + tag + push to ghcr.io
 #   IMAGE_TAG=v0.1 PUSH=1 GHCR_USER=... ./build.sh
@@ -27,6 +29,7 @@ cd "$(dirname "$0")"
 
 TARGET_ARCH="${TARGET_ARCH:-amd64}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
+CONTAINER_TOOL="${CONTAINER_TOOL:-$(command -v podman 2>/dev/null || command -v docker)}"
 
 case "$TARGET_ARCH" in
     amd64) ZIG_TARGET="x86_64-linux-musl" ;;
@@ -72,7 +75,14 @@ CPU_FLAG=""
 if [ "$TARGET_ARCH" = "amd64" ]; then
     CPU_FLAG="-Dcpu=haswell"
 fi
-zig build -Doptimize=ReleaseFast -Dtarget="${ZIG_TARGET}" -Dkeep-alive=true ${CPU_FLAG}
+INSTRUMENT_FLAG=""
+if [ -n "${INSTRUMENT:-}" ]; then
+    # Instrument build: keeps DWARF + frame pointers, exposes GET /__metrics,
+    # adds clock_gettime + counter overhead on the hot path. Use for
+    # bottleneck analysis only — do NOT submit/eval with this.
+    INSTRUMENT_FLAG="-Dinstrument=true"
+fi
+zig build -Doptimize=ReleaseFast -Dtarget="${ZIG_TARGET}" -Dkeep-alive=true ${CPU_FLAG} ${INSTRUMENT_FLAG}
 
 echo
 echo "==> artifacts"
@@ -85,10 +95,14 @@ if [ -z "${IMAGE:-}" ]; then
     exit 0
 fi
 
-LOCAL_TAG="localhost/rinhapuffer:${TARGET_ARCH}"
+LOCAL_TAG_SUFFIX="${TARGET_ARCH}"
+if [ -n "${INSTRUMENT:-}" ]; then
+    LOCAL_TAG_SUFFIX="${TARGET_ARCH}-instrument"
+fi
+LOCAL_TAG="localhost/rinhapuffer:${LOCAL_TAG_SUFFIX}"
 echo
-echo "==> podman build --platform=linux/${TARGET_ARCH} -t ${LOCAL_TAG} ."
-podman build --platform="linux/${TARGET_ARCH}" -t "${LOCAL_TAG}" .
+echo "==> ${CONTAINER_TOOL} build --platform=linux/${TARGET_ARCH} -t ${LOCAL_TAG} ."
+"${CONTAINER_TOOL}" build --platform="linux/${TARGET_ARCH}" -t "${LOCAL_TAG}" .
 
 # ─── 4. (optional) tag + push to GHCR ───────────────────────────────────────
 
@@ -100,10 +114,10 @@ fi
 
 REMOTE_TAG="ghcr.io/${GHCR_USER}/rinhapuffer:${IMAGE_TAG}"
 echo
-echo "==> podman tag ${LOCAL_TAG} ${REMOTE_TAG}"
-podman tag "${LOCAL_TAG}" "${REMOTE_TAG}"
-echo "==> podman push ${REMOTE_TAG}"
-podman push "${REMOTE_TAG}"
+echo "==> ${CONTAINER_TOOL} tag ${LOCAL_TAG} ${REMOTE_TAG}"
+"${CONTAINER_TOOL}" tag "${LOCAL_TAG}" "${REMOTE_TAG}"
+echo "==> ${CONTAINER_TOOL} push ${REMOTE_TAG}"
+"${CONTAINER_TOOL}" push "${REMOTE_TAG}"
 echo
 echo "==> published ${REMOTE_TAG}"
 echo "    update docker-compose.yml \`image:\` lines to ${REMOTE_TAG} for the rinha submission."
