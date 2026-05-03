@@ -8,8 +8,15 @@
 //!   M2 — one-shot recv + writev + close (functional correctness).
 //!   M3 — registered files via accept_multishot_direct.
 //!   M4 — BUF_RING for recv (kernel-provided buffers).
-//!   M5 (this commit) — multishot recv.
-//!   M6 — TCP_NODELAY, generation tag, dedup helpers, polish.
+//!   M5 — multishot recv.
+//!   M6 (this commit) — generation-tagged user_data for stale-CQE drop.
+//!
+//! Deferred from M6:
+//!   - TCP_NODELAY on accepted sockets — registered files require io_uring
+//!     SETSOCKOPT (kernel 6.7+, past our 5.19 floor). Prod is UDS anyway,
+//!     where TCP_NODELAY is meaningless.
+//!   - Helper dedup with http_async.zig — both paths still co-exist;
+//!     consolidate when the epoll path is removed.
 //!
 //! Kernel floor is 5.19 (multishot accept). Multishot recv (6.0) lands in M5.
 
@@ -49,7 +56,10 @@ const PBUF_MASK: u16 = PBUF_COUNT - 1;
 // user_data tag layout (u64):
 //   bits 0..15   slot index (0..MAX_CONNS-1)
 //   bits 16..23  op tag      (ACCEPT, RECV, WRITEV, CLOSE)
-//   bits 24..31  generation  (M6 — bumped on slot reuse for stale-CQE drop)
+//   bits 24..31  generation  (bumped on every accept-init; CQE generation
+//                             must match the slot's current generation,
+//                             else the CQE is from a previous tenant and
+//                             gets dropped)
 //   bits 32..63  reserved
 const OP_ACCEPT: u8 = 0;
 const OP_RECV: u8 = 1;
@@ -68,6 +78,10 @@ inline fn ud_slot(ud: u64) u16 {
     return @intCast(ud & 0xffff);
 }
 
+inline fn ud_gen(ud: u64) u8 {
+    return @intCast((ud >> 24) & 0xff);
+}
+
 const ConnState = enum(u8) { normal, closing };
 
 const Conn = struct {
@@ -79,6 +93,11 @@ const Conn = struct {
     // error terminates the multishot — only then do we re-arm.
     recv_armed: bool,
     write_in_flight: bool,
+    // Bumped on every accept-init for this slot. The current value is encoded
+    // into every SQE's user_data; mismatched CQEs are dropped (stale from a
+    // prior tenant of the same slot, e.g. recv-multishot in flight when the
+    // slot got reused after close_direct).
+    generation: u8,
 
     read_buf: [READ_BUF_SIZE]u8,
     have: u16,
@@ -143,7 +162,10 @@ pub fn run(listen_fd: i32, dispatch: http.Handler) RunError!noreturn {
     }
     linux.IoUring.buf_ring_advance(pbuf_ring, PBUF_COUNT);
 
-    for (0..MAX_CONNS) |i| conns[i].in_use = false;
+    for (0..MAX_CONNS) |i| {
+        conns[i].in_use = false;
+        conns[i].generation = 0;
+    }
     instrument.init();
 
     arm_accept(&ring, listen_fd) catch return error.SubmitFailed;
@@ -189,6 +211,10 @@ fn handle_accept(ring: *linux.IoUring, listen_fd: i32, cqe: linux.io_uring_cqe) 
         instrument.inc(&instrument.accepts, 1);
 
         const conn = &conns[slot];
+        // Wraparound is fine: u8 cycles every 256 reuses. Stale CQEs are
+        // serviced microseconds after the kernel posts them; even at insane
+        // reuse rates the wrap never collides with an actually-stale CQE.
+        const next_gen: u8 = conn.generation +% 1;
         conn.* = .{
             // fd is left zeroed — all subsequent ops use the registered-file
             // index (`slot`) with IOSQE_FIXED_FILE, never the raw fd.
@@ -197,6 +223,7 @@ fn handle_accept(ring: *linux.IoUring, listen_fd: i32, cqe: linux.io_uring_cqe) 
             .in_use = true,
             .recv_armed = false,
             .write_in_flight = false,
+            .generation = next_gen,
             .read_buf = undefined,
             .have = 0,
             .head_buf = undefined,
@@ -225,7 +252,7 @@ fn submit_recv(ring: *linux.IoUring, slot: u16) !void {
     const conn = &conns[slot];
     if (conn.have >= READ_BUF_SIZE) return; // scratch full; can't accept more
     if (conn.recv_armed) return;
-    const ud = make_user_data(slot, OP_RECV, 0);
+    const ud = make_user_data(slot, OP_RECV, conn.generation);
     // BUFFER_SELECT + RECV_MULTISHOT: kernel keeps firing CQEs for every
     // recv on this fd, picking a free buf from BUF_RING per completion,
     // until F_MORE is clear (typically -ENOBUFS or peer-close). One SQE
@@ -245,6 +272,7 @@ fn handle_recv(ring: *linux.IoUring, cqe: linux.io_uring_cqe) RunError!void {
     if (slot >= MAX_CONNS) return;
     const conn = &conns[slot];
     if (!conn.in_use) return;
+    if (ud_gen(cqe.user_data) != conn.generation) return; // stale CQE — slot was reused
 
     // Multishot recv: F_MORE clear means the kernel has retired this SQE.
     // Common causes: -ENOBUFS (ring empty), -ECONNRESET, peer half-close
@@ -381,7 +409,7 @@ fn submit_writev(ring: *linux.IoUring, slot: u16) !void {
     } else {
         return; // already drained
     }
-    const ud = make_user_data(slot, OP_WRITEV, 0);
+    const ud = make_user_data(slot, OP_WRITEV, conn.generation);
     const sqe = try ring.writev(ud, @intCast(slot), iov_buf[0..iov_count], 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     conn.write_in_flight = true;
@@ -392,6 +420,7 @@ fn handle_writev(ring: *linux.IoUring, cqe: linux.io_uring_cqe) RunError!void {
     if (slot >= MAX_CONNS) return;
     const conn = &conns[slot];
     if (!conn.in_use) return;
+    if (ud_gen(cqe.user_data) != conn.generation) return; // stale CQE — slot was reused
     conn.write_in_flight = false;
 
     if (cqe.res < 0) {
@@ -461,13 +490,17 @@ fn start_close(ring: *linux.IoUring, slot: u16) !void {
     // close_direct closes the underlying fd AND releases the registered-file
     // slot back to the kernel's auto-alloc pool — next accept_multishot_direct
     // can pick this slot again.
-    const ud = make_user_data(slot, OP_CLOSE, 0);
+    const ud = make_user_data(slot, OP_CLOSE, conn.generation);
     _ = try ring.close_direct(ud, slot);
 }
 
 fn handle_close(cqe: linux.io_uring_cqe) void {
     const slot = ud_slot(cqe.user_data);
     if (slot >= MAX_CONNS) return;
+    // CLOSE generation is the generation we owned at the time we submitted.
+    // If `conns[slot].generation` already moved past us, a previous close
+    // CQE already cleared in_use and the slot is the new tenant — drop.
+    if (ud_gen(cqe.user_data) != conns[slot].generation) return;
     conns[slot].in_use = false;
     instrument.inc(&instrument.conn_closes, 1);
 }
