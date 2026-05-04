@@ -187,14 +187,3 @@ void prep_close(struct io_uring_sqe *sqe, int fd, uint64_t ud) {
 	sqe->fd = fd;
 	sqe->user_data = ud;
 }
-
-void prep_sendmsg(struct io_uring_sqe *sqe, int fd, struct msghdr *msg,
-                  unsigned msg_flags, uint64_t ud) {
-	memset(sqe, 0, sizeof *sqe);
-	sqe->opcode = IORING_OP_SENDMSG;
-	sqe->fd = fd;
-	sqe->addr = (uintptr_t)msg;
-	sqe->len = 1;          // msg_iovlen — only one iovec in our handoff frame
-	sqe->msg_flags = msg_flags;
-	sqe->user_data = ud;
-}

@@ -47,7 +47,5 @@ void prep_connect(struct io_uring_sqe *sqe, int fd,
                   const struct sockaddr *addr, socklen_t len, uint64_t ud);
 void prep_poll_add(struct io_uring_sqe *sqe, int fd, unsigned poll_mask, uint64_t ud);
 void prep_close(struct io_uring_sqe *sqe, int fd, uint64_t ud);
-void prep_sendmsg(struct io_uring_sqe *sqe, int fd, struct msghdr *msg,
-                  unsigned msg_flags, uint64_t ud);
 
 #endif
