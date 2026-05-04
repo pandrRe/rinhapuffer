@@ -1,24 +1,27 @@
-//! Linux-only async HTTP/1.1 server using io_uring. Replaces the epoll loop
-//! in `http_async.zig`. All allocation is at startup; the hot path is one
-//! `io_uring_enter` syscall per loop tick, amortized across the batch of CQEs
-//! drained that tick.
+//! Linux-only async HTTP/1.1 server using io_uring with **fd-passing accept**.
 //!
-//! Milestones (incremental, see plan in `~/.claude/plans/`):
-//!   M1 — skeleton: multishot accept, close on accept.
-//!   M2 — one-shot recv + writev + close (functional correctness).
-//!   M3 — registered files via accept_multishot_direct.
-//!   M4 — BUF_RING for recv (kernel-provided buffers).
-//!   M5 — multishot recv.
-//!   M6 (this commit) — generation-tagged user_data for stale-CQE drop.
+//! lb is no longer in the data path. Instead, lb (rinhalb) accepts the
+//! public TCP connection and hands the fd to this process via SCM_RIGHTS
+//! over a persistent Unix STREAM control connection. This module:
 //!
-//! Deferred from M6:
-//!   - TCP_NODELAY on accepted sockets — registered files require io_uring
-//!     SETSOCKOPT (kernel 6.7+, past our 5.19 floor). Prod is UDS anyway,
-//!     where TCP_NODELAY is meaningless.
-//!   - Helper dedup with http_async.zig — both paths still co-exist;
-//!     consolidate when the epoll path is removed.
+//!   1. Listens on the api's UDS (bound by main.zig).
+//!   2. Accepts the single control connection from lb (one-shot).
+//!   3. Loops on `recvmsg` against that control connection, extracting one
+//!      client TCP fd per record from the SCM_RIGHTS cmsg.
+//!   4. For each recovered fd, spins up a Conn slot and runs the existing
+//!      multishot-recv → parse → writev → keep-alive loop directly on the
+//!      TCP fd. The kernel handles cross-net-namespace usage transparently
+//!      (the socket's `sk_net` was set when lb accepted; our process ns
+//!      doesn't matter for I/O on the fd).
 //!
-//! Kernel floor is 5.19 (multishot accept). Multishot recv (6.0) lands in M5.
+//! Per-request lb work: zero. Per-connection lb work: one sendmsg(SCM_RIGHTS).
+//! lb scheduling contention with this process under cgroup CFS is no longer
+//! the dominant tail source.
+//!
+//! Trade vs the old accept-multishot-direct path: client fds are raw, not
+//! registered. recv/writev/close SQEs carry the raw fd. Per-SQE cost is a
+//! few hundred ns higher (refcount bump per SQE) but we save the per-conn
+//! IORING_REGISTER_FILES_UPDATE call. Net impact: negligible at our load.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -39,33 +42,36 @@ pub const MAX_CONNS: u32 = 256;
 pub const READ_BUF_SIZE: usize = 8192;
 pub const HEAD_BUF_SIZE: usize = 256;
 
-// SQ depth holds at most: 1 accept-multishot + (1 recv + 1 writev + 1 close)
-// per conn ≈ 3·MAX_CONNS = 768 in the worst burst. Round up to the next
-// power of two with headroom.
+// SQ depth: 1 control-recvmsg + per-conn (recv + writev + close) ≈ 3·MAX_CONNS
+// = 768. Round up to 1024 with headroom.
 const SQ_DEPTH: u16 = 1024;
 const CQES_PER_BATCH: usize = 256;
 
-// Provided-buffer ring: one 8 KiB buffer per slot. `accept_multishot_direct`
-// caps live conns at MAX_CONNS, so PBUF_COUNT == MAX_CONNS guarantees the
-// kernel never runs out of buffers under normal load. Power-of-two enforced
-// by `setup_buf_ring`.
+// Provided-buffer ring: one 8 KiB buffer per slot. PBUF_COUNT == MAX_CONNS
+// guarantees the kernel never runs out of buffers under normal load. Power
+// of two enforced by setup_buf_ring.
 const PBUF_COUNT: u16 = MAX_CONNS;
 const PBUF_SIZE: usize = READ_BUF_SIZE;
 const PBUF_GROUP: u16 = 0;
 const PBUF_MASK: u16 = PBUF_COUNT - 1;
 
 // user_data tag layout (u64):
-//   bits 0..15   slot index (0..MAX_CONNS-1)
-//   bits 16..23  op tag      (ACCEPT, RECV, WRITEV, CLOSE)
-//   bits 24..31  generation  (bumped on every accept-init; CQE generation
-//                             must match the slot's current generation,
-//                             else the CQE is from a previous tenant and
-//                             gets dropped)
-//   bits 32..63  reserved
-const OP_ACCEPT: u8 = 0;
-const OP_RECV: u8 = 1;
-const OP_WRITEV: u8 = 2;
-const OP_CLOSE: u8 = 3;
+//   bits 0..15   slot index (0..MAX_CONNS-1) for client conns
+//                — sentinel SLOT_LISTEN / SLOT_CONTROL for the control path
+//   bits 16..23  op tag (ACCEPT, RECVMSG, RECV, WRITEV, CLOSE)
+//   bits 24..31  generation (bumped on every Conn slot init; CQE generation
+//                must match the slot's current generation, else the CQE is
+//                from a previous tenant and is dropped)
+const OP_ACCEPT: u8 = 0;       // one-shot: control conn from lb
+const OP_RECVMSG: u8 = 1;      // one-shot: pull client fd from control conn
+const OP_RECV: u8 = 2;         // multishot: data on a client TCP fd
+const OP_WRITEV: u8 = 3;       // one-shot: drain response to client TCP fd
+const OP_CLOSE: u8 = 4;        // one-shot: close client TCP fd
+
+// Sentinel slot values for non-Conn-array CQEs (control-path ops). Any value
+// >= MAX_CONNS is treated as a control-path slot, never indexes `conns[]`.
+const SLOT_LISTEN: u16 = MAX_CONNS;
+const SLOT_CONTROL: u16 = MAX_CONNS + 1;
 
 inline fn make_user_data(slot: u16, op: u8, gen: u8) u64 {
     return (@as(u64, gen) << 24) | (@as(u64, op) << 16) | @as(u64, slot);
@@ -86,85 +92,127 @@ inline fn ud_gen(ud: u64) u8 {
 const ConnState = enum(u8) { normal, closing };
 
 const Conn = struct {
+    // Raw TCP fd received via SCM_RIGHTS. Used directly in recv/writev/close
+    // SQEs — no registered-file slot, no IOSQE_FIXED_FILE.
     fd: i32,
     state: ConnState,
     in_use: bool,
-    // True while a multishot recv SQE is live on this slot. The kernel keeps
-    // re-firing recv CQEs (one per data arrival) until F_MORE is clear or an
-    // error terminates the multishot — only then do we re-arm.
     recv_armed: bool,
     write_in_flight: bool,
-    // Bumped on every accept-init for this slot. The current value is encoded
-    // into every SQE's user_data; mismatched CQEs are dropped (stale from a
-    // prior tenant of the same slot, e.g. recv-multishot in flight when the
-    // slot got reused after close_direct).
+    // Bumped on every slot init. Encoded into every SQE's user_data; CQEs
+    // with mismatched generation are dropped (stale tenant after close).
     generation: u8,
 
     read_buf: [READ_BUF_SIZE]u8,
     have: u16,
 
     head_buf: [HEAD_BUF_SIZE]u8,
-    // Two iovecs (head + body). After a partial WRITEV we mutate `base`/`len`
-    // in place and bump `write_iov_idx` once a vec drains. `write_iov_idx`
-    // == 2 means fully drained.
     write_iovs: [2]posix.iovec_const,
     write_iov_idx: u8,
     write_keep_alive: bool,
-    // The iovec slice the kernel reads from while the WRITEV is in flight.
-    // Must outlive the SQE submission — io_uring stores the pointer in the
-    // SQE and the kernel dereferences it asynchronously. Stack-local would
-    // race under concurrent load.
     submit_iovs: [2]posix.iovec_const,
-    // Per-request stage timings. `t_total_ns` is set when the request body
-    // has fully arrived (start of synchronous CPU work); `t_write_ns` is
-    // set just before `submit_writev`. Both are observed in `handle_writev`
-    // when the WRITEV CQE reports the response fully drained, so the
-    // hist_total / hist_write percentiles cover the full kernel send time
-    // (not just the SQE-submit time).
     t_total_ns: u64,
     t_write_ns: u64,
 };
 
-// Conn slot is identified directly by the kernel-allocated registered-file
-// index; `accept_multishot_direct` picks a free slot in [0, MAX_CONNS) and
-// returns it in `cqe.res`. No user-space free list — the kernel manages
-// slot allocation against the sparse table registered at startup.
 var conns: [MAX_CONNS]Conn = undefined;
 
+// Free-slot stack for Conn array. Replaces accept_multishot_direct's
+// kernel-managed slot allocation. A single u16 array indexed by `free_top`;
+// pop returns the highest free slot; push puts it back.
+var free_slots: [MAX_CONNS]u16 = undefined;
+var free_top: usize = 0;
+
+fn init_free_slots() void {
+    free_top = MAX_CONNS;
+    for (0..MAX_CONNS) |i| free_slots[i] = @intCast(MAX_CONNS - 1 - i);
+}
+
+fn pop_slot() ?u16 {
+    if (free_top == 0) return null;
+    free_top -= 1;
+    return free_slots[free_top];
+}
+
+fn push_slot(slot: u16) void {
+    free_slots[free_top] = slot;
+    free_top += 1;
+}
+
 // Provided-buffer ring backing storage. Page-aligned so the addresses the
-// kernel sees (via `buf_ring_add`) are stable across reuse. `pbuf_ring` is
-// the mmap'd shared header from `setup_buf_ring` — kernel and user share
-// it lock-free (kernel reads tail, user writes tail).
+// kernel sees (via buf_ring_add) are stable across reuse.
 var pbuf_storage: [PBUF_COUNT][PBUF_SIZE]u8 align(std.heap.page_size_min) = undefined;
 var pbuf_ring: *align(std.heap.page_size_min) linux.io_uring_buf_ring = undefined;
+
+// ─── control-channel state ──────────────────────────────────────────────────
+//
+// Single persistent connection from lb. recvmsg one-shot pulls one fd per
+// completion via SCM_RIGHTS cmsg.
+
+var control_fd: i32 = -1;
+
+// msghdr/iovec/cmsg storage for recvmsg. Static so the pointers remain valid
+// across SQE submission. One set is enough because recvmsg is one-shot — the
+// kernel reads the layout when the SQE is processed and the ABI populates
+// it during the operation; we read the result on CQE and immediately re-arm.
+var recvmsg_iov_data: [16]u8 = undefined; // 1-byte payload "F" arrives here
+var recvmsg_iov: posix.iovec = undefined;
+var recvmsg_cmsg_buf: [256]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+var recvmsg_hdr: linux.msghdr = undefined;
+
+fn init_recvmsg_hdr() void {
+    recvmsg_iov.base = &recvmsg_iov_data;
+    recvmsg_iov.len = recvmsg_iov_data.len;
+    recvmsg_hdr = .{
+        .name = null,
+        .namelen = 0,
+        .iov = @ptrCast(&recvmsg_iov),
+        .iovlen = 1,
+        .control = &recvmsg_cmsg_buf,
+        .controllen = recvmsg_cmsg_buf.len,
+        .flags = 0,
+    };
+}
+
+// Walk the cmsg buffer after a recvmsg completion and extract the first
+// SCM_RIGHTS fd. Returns -1 if no fd was found (shouldn't happen if lb is
+// behaving). Linux cmsg layout: each cmsghdr is followed by data, padded
+// to alignment; a chain of cmsghdrs ends when one runs past controllen.
+fn extract_fd_from_cmsg() i32 {
+    // Scan the cmsg buffer for the first SCM_RIGHTS record.
+    const got_len: usize = @intCast(recvmsg_hdr.controllen);
+    if (got_len < @sizeOf(linux.cmsghdr)) return -1;
+    var off: usize = 0;
+    while (off + @sizeOf(linux.cmsghdr) <= got_len) {
+        const cmsg: *const linux.cmsghdr = @ptrCast(@alignCast(&recvmsg_cmsg_buf[off]));
+        const cmsg_len: usize = @intCast(cmsg.len);
+        if (cmsg_len < @sizeOf(linux.cmsghdr)) return -1;
+        if (cmsg.level == linux.SOL.SOCKET and cmsg.type == 0x01) {
+            // SCM_RIGHTS == 0x01 on Linux. Extract the first int payload.
+            const data_off = off + cmsg_align(@sizeOf(linux.cmsghdr));
+            if (data_off + @sizeOf(i32) > got_len) return -1;
+            const fd_ptr: *const i32 = @ptrCast(@alignCast(&recvmsg_cmsg_buf[data_off]));
+            return fd_ptr.*;
+        }
+        off += cmsg_align(cmsg_len);
+    }
+    return -1;
+}
+
+// CMSG_ALIGN — round up to sizeof(size_t). Linux uses sizeof(long) which on
+// x86_64-musl is 8.
+inline fn cmsg_align(len: usize) usize {
+    const a = @sizeOf(usize);
+    return (len + a - 1) & ~(@as(usize, a - 1));
+}
 
 pub const RunError = error{
     InitFailed,
     SubmitFailed,
-    AcceptMultishotLost,
+    AcceptFailed,
 };
 
 pub fn run(listen_fd: i32, comptime dispatch: http.Handler) RunError!noreturn {
-    // `dispatch` is a comptime parameter so the compiler specializes every
-    // helper below for this exact handler — the call from `parse_loop`
-    // becomes a direct call, allowing inlining across parse → dispatch →
-    // vectorize → search → format. Removes the indirect-call cost (~1 ns
-    // + branch-predictor pollution) on every request and lets cross-fn
-    // optimizations fire.
-
-    // Tail-latency tuning. SINGLE_ISSUER tells the kernel exactly one task
-    // ever submits SQEs (true here — `run` is the only submitter), skipping
-    // multi-issuer serialization. DEFER_TASKRUN coalesces task-work onto the
-    // next io_uring_enter instead of running it inline at completion time,
-    // which cuts wakeup churn on multishot CQEs. COOP_TASKRUN avoids inter-
-    // processor interrupts when the kernel posts CQEs from another core.
-    //
-    // SQPOLL alternative (build with `-Dsqpoll=true`): kernel spawns a poller
-    // thread that drains the SQ ring without `io_uring_enter`, eliminating
-    // the per-loop-tick syscall entirely. Steady-state cost is ~one core
-    // burned. Mutually exclusive with DEFER_TASKRUN (DEFER_TASKRUN requires
-    // the issuer to drain task-work via enter; SQPOLL bypasses that). We
-    // also push the idle window to 2 ms so brief gaps don't park the poller.
     var params: linux.io_uring_params = std.mem.zeroes(linux.io_uring_params);
     if (comptime build_options.sqpoll) {
         params.flags = linux.IORING_SETUP_SQPOLL |
@@ -177,20 +225,11 @@ pub fn run(listen_fd: i32, comptime dispatch: http.Handler) RunError!noreturn {
             linux.IORING_SETUP_COOP_TASKRUN;
     }
     var ring = linux.IoUring.init_params(SQ_DEPTH, &params) catch blk: {
-        // Older kernel rejected the flag combo. Retry with no flags.
         params = std.mem.zeroes(linux.io_uring_params);
         break :blk linux.IoUring.init_params(SQ_DEPTH, &params) catch return error.InitFailed;
     };
     defer ring.deinit();
 
-    // Sparse registered-file table: MAX_CONNS slots reserved for
-    // accept_multishot_direct's auto-allocation. Listen fd stays raw — we
-    // never IOSQE_FIXED_FILE on the accept SQE's input fd.
-    ring.register_files_sparse(MAX_CONNS) catch return error.InitFailed;
-
-    // Provided-buffer ring: register, then publish all PBUF_COUNT buffers
-    // in one batched advance. After this, recv SQEs can use BUFFER_SELECT
-    // and the kernel picks a buf for each completion.
     pbuf_ring = linux.IoUring.setup_buf_ring(ring.fd, PBUF_COUNT, PBUF_GROUP, .{ .inc = false }) catch return error.InitFailed;
     linux.IoUring.buf_ring_init(pbuf_ring);
     for (0..PBUF_COUNT) |i| {
@@ -204,18 +243,20 @@ pub fn run(listen_fd: i32, comptime dispatch: http.Handler) RunError!noreturn {
     }
     linux.IoUring.buf_ring_advance(pbuf_ring, PBUF_COUNT);
 
+    init_free_slots();
+    init_recvmsg_hdr();
     for (0..MAX_CONNS) |i| {
         conns[i].in_use = false;
         conns[i].generation = 0;
+        conns[i].fd = -1;
     }
     instrument.init();
+    listen_fd_g = listen_fd;
 
-    arm_accept(&ring, listen_fd) catch return error.SubmitFailed;
+    arm_accept_control(&ring, listen_fd) catch return error.SubmitFailed;
 
     var cqes: [CQES_PER_BATCH]linux.io_uring_cqe = undefined;
     while (true) {
-        // submit_and_wait flushes pending SQEs and blocks for ≥1 CQE in one
-        // io_uring_enter — THE syscall budget per loop tick.
         _ = ring.submit_and_wait(1) catch return error.SubmitFailed;
 
         while (true) {
@@ -228,7 +269,8 @@ pub fn run(listen_fd: i32, comptime dispatch: http.Handler) RunError!noreturn {
 
 fn dispatch_cqe(ring: *linux.IoUring, listen_fd: i32, cqe: linux.io_uring_cqe, comptime dispatch: http.Handler) RunError!void {
     switch (ud_op(cqe.user_data)) {
-        OP_ACCEPT => try handle_accept(ring, listen_fd, cqe),
+        OP_ACCEPT => try handle_accept_control(ring, listen_fd, cqe),
+        OP_RECVMSG => try handle_recvmsg(ring, cqe),
         OP_RECV => try handle_recv(ring, cqe, dispatch),
         OP_WRITEV => try handle_writev(ring, cqe, dispatch),
         OP_CLOSE => handle_close(cqe),
@@ -236,62 +278,107 @@ fn dispatch_cqe(ring: *linux.IoUring, listen_fd: i32, cqe: linux.io_uring_cqe, c
     }
 }
 
-// ─── accept ─────────────────────────────────────────────────────────────────
+// ─── control-conn accept ────────────────────────────────────────────────────
+//
+// One-shot accept on the listen UDS. Fires once per lb session (typically
+// once for the lifetime of this process). On a CQE we stash control_fd and
+// arm the recvmsg loop. If lb disconnects later, we re-arm accept to wait
+// for a new lb instance.
 
-fn arm_accept(ring: *linux.IoUring, listen_fd: i32) !void {
-    // Direct multishot accept: kernel-allocates a registered-file slot per
-    // accepted connection and reports that slot index in cqe.res. Saves a
-    // per-accept io_uring_register(REGISTER_FILES_UPDATE) syscall vs the
-    // raw-fd accept_multishot variant.
-    _ = try ring.accept_multishot_direct(make_user_data(0, OP_ACCEPT, 0), listen_fd, null, null, 0);
+fn arm_accept_control(ring: *linux.IoUring, listen_fd: i32) !void {
+    const ud = make_user_data(SLOT_LISTEN, OP_ACCEPT, 0);
+    _ = try ring.accept(ud, listen_fd, null, null, 0);
 }
 
-fn handle_accept(ring: *linux.IoUring, listen_fd: i32, cqe: linux.io_uring_cqe) RunError!void {
-    if (cqe.res >= 0) {
-        const slot: u16 = @intCast(cqe.res);
-        std.debug.assert(slot < MAX_CONNS);
-        instrument.inc(&instrument.accepts, 1);
-
-        const conn = &conns[slot];
-        // Wraparound is fine: u8 cycles every 256 reuses. Stale CQEs are
-        // serviced microseconds after the kernel posts them; even at insane
-        // reuse rates the wrap never collides with an actually-stale CQE.
-        const next_gen: u8 = conn.generation +% 1;
-        conn.* = .{
-            // fd is left zeroed — all subsequent ops use the registered-file
-            // index (`slot`) with IOSQE_FIXED_FILE, never the raw fd.
-            .fd = 0,
-            .state = .normal,
-            .in_use = true,
-            .recv_armed = false,
-            .write_in_flight = false,
-            .generation = next_gen,
-            .read_buf = undefined,
-            .have = 0,
-            .head_buf = undefined,
-            .write_iovs = .{
-                .{ .base = undefined, .len = 0 },
-                .{ .base = undefined, .len = 0 },
-            },
-            .write_iov_idx = 2,
-            .write_keep_alive = true,
-            .submit_iovs = .{
-                .{ .base = undefined, .len = 0 },
-                .{ .base = undefined, .len = 0 },
-            },
-            .t_total_ns = 0,
-            .t_write_ns = 0,
-        };
-
-        submit_recv(ring, slot) catch return error.SubmitFailed;
+fn handle_accept_control(ring: *linux.IoUring, listen_fd: i32, cqe: linux.io_uring_cqe) RunError!void {
+    if (cqe.res < 0) {
+        // Accept failed — wait a tick and retry.
+        arm_accept_control(ring, listen_fd) catch return error.AcceptFailed;
+        return;
     }
-    // res < 0 covers per-accept errors (incl. -ENFILE when the registered
-    // table is full → connection stays in the listen queue, kernel keeps
-    // the multishot armed via F_MORE). Drop silently.
+    control_fd = cqe.res;
+    instrument.inc(&instrument.accepts, 1);
+    arm_recvmsg(ring) catch return error.SubmitFailed;
+}
 
-    if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
-        arm_accept(ring, listen_fd) catch return error.AcceptMultishotLost;
+// ─── recvmsg from lb (fd handoff) ───────────────────────────────────────────
+
+fn arm_recvmsg(ring: *linux.IoUring) !void {
+    if (control_fd < 0) return;
+    // Reset cmsg controllen for the next receive — the kernel writes the
+    // actual size back, so we have to restore the buffer cap each time.
+    recvmsg_hdr.controllen = recvmsg_cmsg_buf.len;
+    recvmsg_hdr.flags = 0;
+    const ud = make_user_data(SLOT_CONTROL, OP_RECVMSG, 0);
+    _ = try ring.recvmsg(ud, control_fd, &recvmsg_hdr, 0);
+}
+
+fn handle_recvmsg(ring: *linux.IoUring, cqe: linux.io_uring_cqe) RunError!void {
+    if (cqe.res <= 0) {
+        // lb disconnected (peer close or error). Drop control_fd and re-arm
+        // accept so a new lb can attach.
+        if (control_fd >= 0) {
+            _ = linux.close(control_fd);
+            control_fd = -1;
+        }
+        // Caller's loop will re-arm accept on next tick — but we'd lose that
+        // signal here. Instead: caller should detect control_fd==-1 and
+        // arm accept. Simpler: arm here, but we need listen_fd which we
+        // don't have. Stash it at startup as a global to keep this tidy.
+        listen_fd_g_arm_accept(ring) catch {};
+        return;
     }
+    const client_fd = extract_fd_from_cmsg();
+    if (client_fd < 0) {
+        // Malformed cmsg — re-arm and continue.
+        arm_recvmsg(ring) catch return error.SubmitFailed;
+        return;
+    }
+    const slot = pop_slot() orelse {
+        // Conn table full — close the fd to avoid leaking.
+        _ = linux.close(client_fd);
+        arm_recvmsg(ring) catch return error.SubmitFailed;
+        return;
+    };
+    init_conn(slot, client_fd);
+    submit_recv(ring, slot) catch return error.SubmitFailed;
+    arm_recvmsg(ring) catch return error.SubmitFailed;
+}
+
+// listen_fd is needed by handle_recvmsg's lb-disconnect path. Stashed at
+// run() entry into a module-level global so the dispatch handlers don't
+// need it threaded through.
+var listen_fd_g: i32 = -1;
+fn listen_fd_g_arm_accept(ring: *linux.IoUring) !void {
+    if (listen_fd_g >= 0) try arm_accept_control(ring, listen_fd_g);
+}
+
+fn init_conn(slot: u16, client_fd: i32) void {
+    const conn = &conns[slot];
+    const next_gen: u8 = conn.generation +% 1;
+    conn.* = .{
+        .fd = client_fd,
+        .state = .normal,
+        .in_use = true,
+        .recv_armed = false,
+        .write_in_flight = false,
+        .generation = next_gen,
+        .read_buf = undefined,
+        .have = 0,
+        .head_buf = undefined,
+        .write_iovs = .{
+            .{ .base = undefined, .len = 0 },
+            .{ .base = undefined, .len = 0 },
+        },
+        .write_iov_idx = 2,
+        .write_keep_alive = true,
+        .submit_iovs = .{
+            .{ .base = undefined, .len = 0 },
+            .{ .base = undefined, .len = 0 },
+        },
+        .t_total_ns = 0,
+        .t_write_ns = 0,
+    };
 }
 
 // ─── recv ──────────────────────────────────────────────────────────────────
@@ -300,17 +387,12 @@ fn submit_recv(ring: *linux.IoUring, slot: u16) !void {
     const conn = &conns[slot];
     if (conn.have >= READ_BUF_SIZE) return; // scratch full; can't accept more
     if (conn.recv_armed) return;
+    if (conn.fd < 0) return;
     const ud = make_user_data(slot, OP_RECV, conn.generation);
-    // BUFFER_SELECT + RECV_MULTISHOT: kernel keeps firing CQEs for every
-    // recv on this fd, picking a free buf from BUF_RING per completion,
-    // until F_MORE is clear (typically -ENOBUFS or peer-close). One SQE
-    // per conn lifetime, not per request — the steady-state syscall budget
-    // collapses to one io_uring_enter per loop tick.
-    const sqe = try ring.recv(ud, @intCast(slot), .{ .buffer_selection = .{
+    const sqe = try ring.recv(ud, conn.fd, .{ .buffer_selection = .{
         .group_id = PBUF_GROUP,
         .len = PBUF_SIZE,
     } }, 0);
-    sqe.flags |= linux.IOSQE_FIXED_FILE;
     sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
     conn.recv_armed = true;
 }
@@ -320,20 +402,13 @@ fn handle_recv(ring: *linux.IoUring, cqe: linux.io_uring_cqe, comptime dispatch:
     if (slot >= MAX_CONNS) return;
     const conn = &conns[slot];
     if (!conn.in_use) return;
-    if (ud_gen(cqe.user_data) != conn.generation) return; // stale CQE — slot was reused
+    if (ud_gen(cqe.user_data) != conn.generation) return;
 
-    // Multishot recv: F_MORE clear means the kernel has retired this SQE.
-    // Common causes: -ENOBUFS (ring empty), -ECONNRESET, peer half-close
-    // with res==0, or some error paths. Once retired we must explicitly
-    // re-arm to keep receiving.
     if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
         conn.recv_armed = false;
     }
 
     if (cqe.res < 0) {
-        // -ENOBUFS is recoverable — we always release a buf back on every
-        // successful recv, so it's effectively only the burst-startup case.
-        // Re-arm and continue. Other negatives are I/O errors → close.
         if (cqe.res == -@as(i32, @intFromEnum(linux.E.NOBUFS))) {
             if (conn.state == .normal and !conn.recv_armed and conn.have < READ_BUF_SIZE) {
                 submit_recv(ring, slot) catch return error.SubmitFailed;
@@ -344,18 +419,11 @@ fn handle_recv(ring: *linux.IoUring, cqe: linux.io_uring_cqe, comptime dispatch:
         return;
     }
     if (cqe.res == 0) {
-        // peer half-closed. (BUFFER_SELECT recvs with res==0 don't have
-        // F_BUFFER set — no buffer to release.)
         start_close(ring, slot) catch return error.SubmitFailed;
         return;
     }
 
-    // Decode the kernel-picked buffer ID from cqe.flags, copy into the
-    // parser-stable scratch, then re-publish the buf back to the ring so
-    // it's immediately available for the next recv.
     const buf_id = cqe.buffer_id() catch {
-        // CQE has no F_BUFFER bit despite res > 0 — unexpected; treat as
-        // recv error and close.
         start_close(ring, slot) catch return error.SubmitFailed;
         return;
     };
@@ -369,12 +437,9 @@ fn handle_recv(ring: *linux.IoUring, cqe: linux.io_uring_cqe, comptime dispatch:
 
     parse_loop(ring, slot, dispatch) catch return error.SubmitFailed;
 
-    // If the multishot terminated (F_MORE was clear) and we're still alive
-    // with room, re-arm. Otherwise the kernel keeps streaming — no SQE.
     if (conn.state == .normal and !conn.recv_armed and conn.have < READ_BUF_SIZE) {
         submit_recv(ring, slot) catch return error.SubmitFailed;
     }
-    // Buffer is full but no parseable request — header oversize.
     if (conn.have == READ_BUF_SIZE and !conn.write_in_flight and conn.state == .normal) {
         send_status_close(ring, slot, 413) catch return error.SubmitFailed;
     }
@@ -385,9 +450,6 @@ fn handle_recv(ring: *linux.IoUring, cqe: linux.io_uring_cqe, comptime dispatch:
 fn parse_loop(ring: *linux.IoUring, slot: u16, comptime dispatch: http.Handler) !void {
     const conn = &conns[slot];
     while (conn.state == .normal and !conn.write_in_flight) {
-        // Single header walk: returns null when \r\n\r\n isn't here yet,
-        // otherwise yields method/path/keep_alive + the offsets we need
-        // to size the body. Replaces the old `indexOf+sniff+parse` triple.
         const t_parse = instrument.now_ns();
         const hp = http.parse_headers(conn.read_buf[0..conn.have]) catch |err| {
             instrument.inc(&instrument.req_parse_err, 1);
@@ -399,10 +461,8 @@ fn parse_loop(ring: *linux.IoUring, slot: u16, comptime dispatch: http.Handler) 
             try send_status_close(ring, slot, 413);
             return;
         }
-        if (total > conn.have) return; // need more bytes
+        if (total > conn.have) return;
         instrument.observe_since(&instrument.hist_parse, t_parse);
-        // Mark the start of the full request lifecycle. Observed in
-        // handle_writev when WRITEV fully drains.
         conn.t_total_ns = t_parse;
 
         const body: []const u8 = if (hp.method == .post)
@@ -436,8 +496,6 @@ fn parse_loop(ring: *linux.IoUring, slot: u16, comptime dispatch: http.Handler) 
         conn.t_write_ns = instrument.now_ns();
         try submit_writev(ring, slot);
         advance_read(conn, total);
-        // Loop to look for the next pipelined request — but only if writev
-        // didn't end up needing the buffer (it shouldn't, we already sliced).
     }
 }
 
@@ -456,11 +514,6 @@ fn advance_read(conn: *Conn, consumed: usize) void {
 
 fn submit_writev(ring: *linux.IoUring, slot: u16) !void {
     const conn = &conns[slot];
-    // The iovec backing storage MUST outlive the SQE — io_uring captures the
-    // pointer and dereferences it asynchronously. Use the per-conn
-    // `submit_iovs` field, not a stack-local: under concurrent load the
-    // stack frame would be reused before the kernel reads it, corrupting
-    // the iovec and emitting a garbled head/body on the wire.
     var iov_count: usize = 0;
     if (conn.write_iov_idx == 0) {
         conn.submit_iovs[0] = conn.write_iovs[0];
@@ -473,11 +526,10 @@ fn submit_writev(ring: *linux.IoUring, slot: u16) !void {
         conn.submit_iovs[0] = conn.write_iovs[1];
         iov_count = 1;
     } else {
-        return; // already drained
+        return;
     }
     const ud = make_user_data(slot, OP_WRITEV, conn.generation);
-    const sqe = try ring.writev(ud, @intCast(slot), conn.submit_iovs[0..iov_count], 0);
-    sqe.flags |= linux.IOSQE_FIXED_FILE;
+    _ = try ring.writev(ud, conn.fd, conn.submit_iovs[0..iov_count], 0);
     conn.write_in_flight = true;
 }
 
@@ -486,11 +538,10 @@ fn handle_writev(ring: *linux.IoUring, cqe: linux.io_uring_cqe, comptime dispatc
     if (slot >= MAX_CONNS) return;
     const conn = &conns[slot];
     if (!conn.in_use) return;
-    if (ud_gen(cqe.user_data) != conn.generation) return; // stale CQE — slot was reused
+    if (ud_gen(cqe.user_data) != conn.generation) return;
     conn.write_in_flight = false;
 
     if (cqe.res < 0) {
-        // Write error → close.
         start_close(ring, slot) catch return error.SubmitFailed;
         return;
     }
@@ -498,13 +549,10 @@ fn handle_writev(ring: *linux.IoUring, cqe: linux.io_uring_cqe, comptime dispatc
     advance_write(conn, @intCast(cqe.res));
 
     if (conn.write_iov_idx != 2) {
-        // Partial — resubmit the tail.
         submit_writev(ring, slot) catch return error.SubmitFailed;
         return;
     }
 
-    // Fully drained — observe write + total stage timings here so they
-    // include kernel send completion, not just the SQE submit.
     instrument.observe_since(&instrument.hist_write, conn.t_write_ns);
     instrument.observe_since(&instrument.hist_total, conn.t_total_ns);
 
@@ -512,9 +560,7 @@ fn handle_writev(ring: *linux.IoUring, cqe: linux.io_uring_cqe, comptime dispatc
         start_close(ring, slot) catch return error.SubmitFailed;
         return;
     }
-    // Try to dispatch the next pipelined request.
     parse_loop(ring, slot, dispatch) catch return error.SubmitFailed;
-    // Re-arm recv if room and no recv pending.
     if (conn.state == .normal and !conn.recv_armed and conn.have < READ_BUF_SIZE) {
         submit_recv(ring, slot) catch return error.SubmitFailed;
     }
@@ -552,26 +598,24 @@ fn start_close(ring: *linux.IoUring, slot: u16) !void {
     const conn = &conns[slot];
     if (conn.state == .closing) return;
     conn.state = .closing;
-    if (conn.write_in_flight) {
-        // Wait for the pending WRITEV CQE; it'll re-enter start_close from
-        // its own error/keep-alive=false path. Don't double-submit close.
+    if (conn.write_in_flight) return;
+    if (conn.fd < 0) {
+        // Already closed somehow — just free the slot.
+        conn.in_use = false;
+        push_slot(slot);
         return;
     }
-    // close_direct closes the underlying fd AND releases the registered-file
-    // slot back to the kernel's auto-alloc pool — next accept_multishot_direct
-    // can pick this slot again.
     const ud = make_user_data(slot, OP_CLOSE, conn.generation);
-    _ = try ring.close_direct(ud, slot);
+    _ = try ring.close(ud, conn.fd);
 }
 
 fn handle_close(cqe: linux.io_uring_cqe) void {
     const slot = ud_slot(cqe.user_data);
     if (slot >= MAX_CONNS) return;
-    // CLOSE generation is the generation we owned at the time we submitted.
-    // If `conns[slot].generation` already moved past us, a previous close
-    // CQE already cleared in_use and the slot is the new tenant — drop.
     if (ud_gen(cqe.user_data) != conns[slot].generation) return;
     conns[slot].in_use = false;
+    conns[slot].fd = -1;
+    push_slot(slot);
     instrument.inc(&instrument.conn_closes, 1);
 }
 
@@ -596,8 +640,6 @@ fn send_status_close(ring: *linux.IoUring, slot: u16, status: u16) !void {
     try submit_writev(ring, slot);
 }
 
-// ─── parse helpers ──────────────────────────────────────────────────────────
-
 fn map_parse_status(err: http.ParseError) u16 {
     return switch (err) {
         error.UnsupportedMethod, error.UnsupportedVersion, error.Malformed, error.MissingContentLength => 400,
@@ -611,6 +653,25 @@ test "user_data tag pack/unpack round-trip" {
     const ud = make_user_data(42, OP_RECV, 7);
     try std.testing.expectEqual(@as(u16, 42), ud_slot(ud));
     try std.testing.expectEqual(OP_RECV, ud_op(ud));
+    try std.testing.expectEqual(@as(u8, 7), ud_gen(ud));
+}
+
+test "free-slot stack pop/push round-trip" {
+    init_free_slots();
+    try std.testing.expectEqual(@as(usize, MAX_CONNS), free_top);
+    const a = pop_slot().?;
+    const b = pop_slot().?;
+    try std.testing.expect(a != b);
+    push_slot(a);
+    push_slot(b);
+    try std.testing.expectEqual(@as(usize, MAX_CONNS), free_top);
+}
+
+test "free-slot stack exhaustion returns null" {
+    init_free_slots();
+    var i: usize = 0;
+    while (i < MAX_CONNS) : (i += 1) _ = pop_slot().?;
+    try std.testing.expect(pop_slot() == null);
 }
 
 test "advance_write: head only, partial then full" {
@@ -638,7 +699,7 @@ test "advance_write: spans head and body in one call" {
         .{ .base = "xyzpqr".ptr, .len = 6 },
     };
     conn.write_iov_idx = 0;
-    advance_write(&conn, 5); // 3 head + 2 body
+    advance_write(&conn, 5);
     try std.testing.expectEqual(@as(u8, 1), conn.write_iov_idx);
     try std.testing.expectEqual(@as(usize, 4), conn.write_iovs[1].len);
 }
@@ -646,4 +707,21 @@ test "advance_write: spans head and body in one call" {
 test "map_parse_status — 400 vs 413" {
     try std.testing.expectEqual(@as(u16, 400), map_parse_status(error.UnsupportedMethod));
     try std.testing.expectEqual(@as(u16, 413), map_parse_status(error.BodyTooLarge));
+}
+
+test "extract_fd_from_cmsg: well-formed SCM_RIGHTS frame" {
+    init_recvmsg_hdr();
+    // Build a cmsg with SCM_RIGHTS containing fd=42.
+    @memset(&recvmsg_cmsg_buf, 0);
+    const cmsg: *linux.cmsghdr = @ptrCast(@alignCast(&recvmsg_cmsg_buf));
+    cmsg.len = @sizeOf(linux.cmsghdr) + @sizeOf(i32);
+    cmsg.level = linux.SOL.SOCKET;
+    cmsg.type = 0x01; // SCM_RIGHTS
+    const data_off = cmsg_align(@sizeOf(linux.cmsghdr));
+    const fd_target_ptr: *i32 = @ptrCast(@alignCast(&recvmsg_cmsg_buf[data_off]));
+    fd_target_ptr.* = 42;
+    recvmsg_hdr.controllen = cmsg_align(cmsg.len);
+
+    const got = extract_fd_from_cmsg();
+    try std.testing.expectEqual(@as(i32, 42), got);
 }
