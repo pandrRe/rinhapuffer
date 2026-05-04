@@ -37,7 +37,7 @@ const PROBE_CLUSTERS: usize = 1;
 /// unbounded version because the unbounded scan only ever scans clusters
 /// with `lb_sq < top_dists[0]`, which (after PROBE seeds tight) is a
 /// small set living in the closest-bbox region.
-const REPAIR_TOP_N: usize = 64;
+const REPAIR_TOP_N: usize = 8;
 
 /// Variance-ordered feature index permutation, taken from thiagorigonatti's
 /// IVF6 reference (rinha 2026 #1 leaderboard). Most-discriminating features
