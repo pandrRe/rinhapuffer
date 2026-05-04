@@ -78,6 +78,15 @@ pub const IvfQuantizedDataset = struct {
     bbox_lo: []const i16,
     /// `[k_clusters * N_FEATURES]i16` — per-(cluster, feature) max, AoS by cluster.
     bbox_hi: []const i16,
+    /// Step-1 SIMD-friendly mirrors of the three per-cluster metadata regions
+    /// padded from 14 to 16 lanes. Lanes 14–15 hold zero in both centroid
+    /// and bbox; the query is also zero-padded so they cancel in the diff.
+    /// 64B-aligned ⇒ `vmovaps` for f32, 32B-aligned ⇒ `vmovdqa` for i16.
+    /// Built at load time in `dataset_blob.load`. Tests that exercise only
+    /// `euclidean_topk_q_ivf_full` (no centroid stage) may pass empty slices.
+    centroids_padded: []align(64) const f32,
+    bbox_lo_padded: []align(64) const i16,
+    bbox_hi_padded: []align(64) const i16,
 };
 
 pub const Error = fast_json.ParseError || error{BufferTooSmall};

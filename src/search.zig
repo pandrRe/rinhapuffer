@@ -126,30 +126,40 @@ pub fn euclidean_topk_q_ivf(
     quantize_query(q, &q_int);
 
     // Step 1 (combined): per cluster, compute centroid distance² AND bbox
-    // lower-bound² in the same loop. Both metadata regions (centroids 56KB,
-    // bbox_lo+hi 56KB) are L2-resident and prefetched as the loop streams.
+    // lower-bound² in the same loop. Operates on 16-lane padded mirrors of
+    // the per-cluster metadata (lanes 14–15 are zero in centroid AND query
+    // ⇒ they cancel in the diff). On Haswell `@Vector(16, f32)` lowers to
+    // exactly two ymm vsubps + two vmulps + a 16-lane horizontal reduce —
+    // no awkward partial vectors, no masking. The on-disk 14-lane layout
+    // is preserved; padding happens at load time in `dataset_blob.populate`.
     var centroid_dists: [MAX_K_CLUSTERS]f32 = undefined;
     var lb_sq: [MAX_K_CLUSTERS]i64 = undefined;
-    const Vf = @Vector(N_FEATURES, f32);
-    const Vi16N = @Vector(N_FEATURES, i16);
-    const Vi32N = @Vector(N_FEATURES, i32);
-    const Vi64N = @Vector(N_FEATURES, i64);
-    const qv_f: Vf = q.*;
-    const qv_i32: Vi32N = @as(Vi16N, q_int);
-    const zero_i32: Vi32N = @splat(0);
+    const N_PAD: usize = 16;
+    const Vf16 = @Vector(N_PAD, f32);
+    const Vi16P = @Vector(N_PAD, i16);
+    const Vi32P = @Vector(N_PAD, i32);
+    const Vi64P = @Vector(N_PAD, i64);
+
+    var q_pad: [N_PAD]f32 align(64) = @splat(0);
+    var q_int_pad: [N_PAD]i16 align(64) = @splat(0);
+    inline for (0..N_FEATURES) |k| q_pad[k] = q[k];
+    inline for (0..N_FEATURES) |k| q_int_pad[k] = q_int[k];
+    const qv_f: Vf16 = q_pad;
+    const qv_i32: Vi32P = @as(Vi16P, q_int_pad);
+    const zero_i32: Vi32P = @splat(0);
     for (0..qds.k_clusters) |c| {
-        const cv: Vf = qds.centroids[c * N_FEATURES ..][0..N_FEATURES].*;
+        const cv: Vf16 = qds.centroids_padded[c * N_PAD ..][0..N_PAD].*;
         const diff = qv_f - cv;
         centroid_dists[c] = @reduce(.Add, diff * diff);
 
-        const lo: Vi16N = qds.bbox_lo[c * N_FEATURES ..][0..N_FEATURES].*;
-        const hi: Vi16N = qds.bbox_hi[c * N_FEATURES ..][0..N_FEATURES].*;
-        const lo_i32: Vi32N = lo;
-        const hi_i32: Vi32N = hi;
-        const below_lo: Vi32N = lo_i32 - qv_i32;
-        const above_hi: Vi32N = qv_i32 - hi_i32;
-        const d: Vi32N = @max(zero_i32, @max(below_lo, above_hi));
-        const d_i64: Vi64N = d;
+        const lo: Vi16P = qds.bbox_lo_padded[c * N_PAD ..][0..N_PAD].*;
+        const hi: Vi16P = qds.bbox_hi_padded[c * N_PAD ..][0..N_PAD].*;
+        const lo_i32: Vi32P = lo;
+        const hi_i32: Vi32P = hi;
+        const below_lo: Vi32P = lo_i32 - qv_i32;
+        const above_hi: Vi32P = qv_i32 - hi_i32;
+        const d: Vi32P = @max(zero_i32, @max(below_lo, above_hi));
+        const d_i64: Vi64P = d;
         lb_sq[c] = @reduce(.Add, d_i64 * d_i64);
     }
 
@@ -780,6 +790,10 @@ test "euclidean_topk_q_ivf hand-built tiny clustered dataset" {
         &cluster_block_starts,
     );
 
+    // `_ivf_full` doesn't touch the centroid stage (no PROBE select, no bbox
+    // pruning) so empty padded slices are fine.
+    const empty_f32 align(64) = [_]f32{};
+    const empty_i16 align(64) = [_]i16{};
     const qds: transform_reference.IvfQuantizedDataset = .{
         .n = n,
         .k_clusters = k_clusters,
@@ -790,6 +804,9 @@ test "euclidean_topk_q_ivf hand-built tiny clustered dataset" {
         .cluster_block_starts = &cluster_block_starts,
         .bbox_lo = &bbox_lo,
         .bbox_hi = &bbox_hi,
+        .centroids_padded = &empty_f32,
+        .bbox_lo_padded = &empty_i16,
+        .bbox_hi_padded = &empty_i16,
     };
 
     var q: [N_FEATURES]f32 = @splat(0);

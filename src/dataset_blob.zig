@@ -252,6 +252,7 @@ pub const LoadError = error{
     UnsupportedKClusters,
     UnsupportedFixScale,
     Truncated,
+    OutOfMemory,
 } || fast_json.MmapError;
 
 pub const WriteError = error{TooManyRecords} ||
@@ -259,12 +260,54 @@ pub const WriteError = error{TooManyRecords} ||
     std.Io.File.Writer.Error ||
     std.mem.Allocator.Error;
 
-/// mmap-backed quantized + IVF dataset. `deinit` munmaps.
+/// Padded mirror of the centroid stage's per-cluster metadata. The on-disk
+/// blob stores 14-lane centroids/bboxes (size-optimal); step 1 in `search.zig`
+/// loads them as `@Vector(16, _)` for clean two-ymm SIMD on Haswell, so we
+/// allocate aligned 16-lane buffers at load time and copy from the mmap with
+/// lanes 14–15 zeroed. Lifetime is tied to the blob; `deinit` frees them
+/// against `page_allocator` (matching the `alignedAlloc` in `populate`).
+pub const PaddedCentroidStage = struct {
+    centroids: []align(64) f32,
+    bbox_lo: []align(64) i16,
+    bbox_hi: []align(64) i16,
+
+    pub fn populate(k_clusters: usize, c14: []const f32, lo14: []const i16, hi14: []const i16) !PaddedCentroidStage {
+        const allocator = std.heap.page_allocator;
+        const c16 = try allocator.alignedAlloc(f32, .@"64", k_clusters * 16);
+        errdefer allocator.free(c16);
+        const lo16 = try allocator.alignedAlloc(i16, .@"64", k_clusters * 16);
+        errdefer allocator.free(lo16);
+        const hi16 = try allocator.alignedAlloc(i16, .@"64", k_clusters * 16);
+        errdefer allocator.free(hi16);
+
+        @memset(c16, 0);
+        @memset(lo16, 0);
+        @memset(hi16, 0);
+        for (0..k_clusters) |c| {
+            @memcpy(c16[c * 16 ..][0..N_FEATURES], c14[c * N_FEATURES ..][0..N_FEATURES]);
+            @memcpy(lo16[c * 16 ..][0..N_FEATURES], lo14[c * N_FEATURES ..][0..N_FEATURES]);
+            @memcpy(hi16[c * 16 ..][0..N_FEATURES], hi14[c * N_FEATURES ..][0..N_FEATURES]);
+        }
+        return .{ .centroids = c16, .bbox_lo = lo16, .bbox_hi = hi16 };
+    }
+
+    pub fn deinit(self: PaddedCentroidStage) void {
+        const allocator = std.heap.page_allocator;
+        allocator.free(self.centroids);
+        allocator.free(self.bbox_lo);
+        allocator.free(self.bbox_hi);
+    }
+};
+
+/// mmap-backed quantized + IVF dataset. `deinit` munmaps and frees padded
+/// centroid-stage mirrors.
 pub const IvfQuantizedBlob = struct {
     mapped: fast_json.Mapped,
     dataset: transform_reference.IvfQuantizedDataset,
+    padded: PaddedCentroidStage,
 
     pub fn deinit(self: IvfQuantizedBlob) void {
+        self.padded.deinit();
         self.mapped.deinit();
     }
 };
@@ -327,8 +370,10 @@ fn load_inner(mapped: fast_json.Mapped, hdr: *const Header) LoadError!IvfQuantiz
     const labels_ptr: [*]const u64 = @ptrCast(@alignCast(mapped.bytes.ptr + off.labels));
     const labels_bits = labels_ptr[0..labels_word_count(hdr.n)];
 
+    const padded = PaddedCentroidStage.populate(hdr.k_clusters, centroids, bbox_lo, bbox_hi) catch return error.OutOfMemory;
     return .{
         .mapped = mapped,
+        .padded = padded,
         .dataset = .{
             .n = hdr.n,
             .k_clusters = hdr.k_clusters,
@@ -339,6 +384,9 @@ fn load_inner(mapped: fast_json.Mapped, hdr: *const Header) LoadError!IvfQuantiz
             .cluster_block_starts = cluster_block_starts,
             .bbox_lo = bbox_lo,
             .bbox_hi = bbox_hi,
+            .centroids_padded = padded.centroids,
+            .bbox_lo_padded = padded.bbox_lo,
+            .bbox_hi_padded = padded.bbox_hi,
         },
     };
 }
