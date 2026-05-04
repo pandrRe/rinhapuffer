@@ -115,6 +115,14 @@ const Conn = struct {
     // SQE and the kernel dereferences it asynchronously. Stack-local would
     // race under concurrent load.
     submit_iovs: [2]posix.iovec_const,
+    // Per-request stage timings. `t_total_ns` is set when the request body
+    // has fully arrived (start of synchronous CPU work); `t_write_ns` is
+    // set just before `submit_writev`. Both are observed in `handle_writev`
+    // when the WRITEV CQE reports the response fully drained, so the
+    // hist_total / hist_write percentiles cover the full kernel send time
+    // (not just the SQE-submit time).
+    t_total_ns: u64,
+    t_write_ns: u64,
 };
 
 // Conn slot is identified directly by the kernel-allocated registered-file
@@ -271,6 +279,8 @@ fn handle_accept(ring: *linux.IoUring, listen_fd: i32, cqe: linux.io_uring_cqe) 
                 .{ .base = undefined, .len = 0 },
                 .{ .base = undefined, .len = 0 },
             },
+            .t_total_ns = 0,
+            .t_write_ns = 0,
         };
 
         submit_recv(ring, slot) catch return error.SubmitFailed;
@@ -378,6 +388,7 @@ fn parse_loop(ring: *linux.IoUring, slot: u16, comptime dispatch: http.Handler) 
         // Single header walk: returns null when \r\n\r\n isn't here yet,
         // otherwise yields method/path/keep_alive + the offsets we need
         // to size the body. Replaces the old `indexOf+sniff+parse` triple.
+        const t_parse = instrument.now_ns();
         const hp = http.parse_headers(conn.read_buf[0..conn.have]) catch |err| {
             instrument.inc(&instrument.req_parse_err, 1);
             try send_status_close(ring, slot, map_parse_status(err));
@@ -389,6 +400,10 @@ fn parse_loop(ring: *linux.IoUring, slot: u16, comptime dispatch: http.Handler) 
             return;
         }
         if (total > conn.have) return; // need more bytes
+        instrument.observe_since(&instrument.hist_parse, t_parse);
+        // Mark the start of the full request lifecycle. Observed in
+        // handle_writev when WRITEV fully drains.
+        conn.t_total_ns = t_parse;
 
         const body: []const u8 = if (hp.method == .post)
             conn.read_buf[hp.headers_end..total]
@@ -418,6 +433,7 @@ fn parse_loop(ring: *linux.IoUring, slot: u16, comptime dispatch: http.Handler) 
         conn.write_iovs[1] = .{ .base = resp.body.ptr, .len = resp.body.len };
         conn.write_iov_idx = 0;
         conn.write_keep_alive = resp.keep_alive;
+        conn.t_write_ns = instrument.now_ns();
         try submit_writev(ring, slot);
         advance_read(conn, total);
         // Loop to look for the next pipelined request — but only if writev
@@ -487,7 +503,11 @@ fn handle_writev(ring: *linux.IoUring, cqe: linux.io_uring_cqe, comptime dispatc
         return;
     }
 
-    // Drained.
+    // Fully drained — observe write + total stage timings here so they
+    // include kernel send completion, not just the SQE submit.
+    instrument.observe_since(&instrument.hist_write, conn.t_write_ns);
+    instrument.observe_since(&instrument.hist_total, conn.t_total_ns);
+
     if (!conn.write_keep_alive) {
         start_close(ring, slot) catch return error.SubmitFailed;
         return;

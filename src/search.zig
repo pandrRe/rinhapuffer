@@ -39,6 +39,16 @@ const PROBE_CLUSTERS: usize = 1;
 /// small set living in the closest-bbox region.
 const REPAIR_TOP_N: usize = 64;
 
+/// Variance-ordered feature index permutation, taken from thiagorigonatti's
+/// IVF6 reference (rinha 2026 #1 leaderboard). Most-discriminating features
+/// come first so the mid-loop early-out at `EARLY_OUT_AT = N_FEATURES / 2`
+/// fires earlier — partial-sum exceeds the top-K worst after fewer features,
+/// pruning more blocks before they pay the second-half feature cost.
+/// Both prep and search consume the same field-to-index mapping via
+/// `transform_reference.parse_into`, so this static permutation aligns with
+/// the rinha references format.
+const FEATURE_ORDER: [N_FEATURES]usize = .{ 5, 6, 2, 0, 7, 8, 11, 12, 9, 10, 1, 13, 3, 4 };
+
 /// Global fixed-point scale. Persisted in the v5 blob header so a stale blob
 /// built against a different value is rejected at load time.
 pub const FIX_SCALE: i32 = 10000;
@@ -265,7 +275,10 @@ inline fn scan_cluster_blocks(
         // ≈ 42 vector ops on every pruned block.
         const EARLY_OUT_AT: usize = N_FEATURES / 2;
         var dist: BVi64 = @splat(0);
-        inline for (0..EARLY_OUT_AT) |k| {
+        // First half: highest-variance features first (FEATURE_ORDER) so
+        // partial-sum tightens fast → more blocks prune before second half.
+        inline for (0..EARLY_OUT_AT) |i| {
+            const k = FEATURE_ORDER[i];
             const r_i16: BVi16 = qds.block_features[block_base + k * BLOCK_W ..][0..BLOCK_W].*;
             const diff_i16: BVi16 = q_vec[k] - r_i16;
             const diff_i32: BVi32 = diff_i16;
@@ -276,7 +289,8 @@ inline fn scan_cluster_blocks(
             instrument.inc(&instrument.search_blocks_early_pruned, 1);
             continue;
         }
-        inline for (EARLY_OUT_AT..N_FEATURES) |k| {
+        inline for (EARLY_OUT_AT..N_FEATURES) |i| {
+            const k = FEATURE_ORDER[i];
             const r_i16: BVi16 = qds.block_features[block_base + k * BLOCK_W ..][0..BLOCK_W].*;
             const diff_i16: BVi16 = q_vec[k] - r_i16;
             const diff_i32: BVi32 = diff_i16;
