@@ -24,8 +24,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.20"
-          memory: "20MB"
+          cpus: "0.30"
+          memory: "30MB"
 
   api1:
     image: ${RINHAPUFFER_IMAGE:-ghcr.io/pandrre/rinhapuffer:latest}
@@ -38,8 +38,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
-          memory: "165MB"
+          cpus: "0.35"
+          memory: "160MB"
 
   api2:
     image: ${RINHAPUFFER_IMAGE:-ghcr.io/pandrre/rinhapuffer:latest}
@@ -52,8 +52,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
-          memory: "165MB"
+          cpus: "0.35"
+          memory: "160MB"
 
 volumes:
   sockets:
