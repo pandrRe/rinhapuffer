@@ -57,11 +57,23 @@ pub fn build(b: *std.Build) void {
     // experiment. Incompatible with DEFER_TASKRUN; we swap the flag combo
     // when this is set. Default off.
     const sqpoll = b.option(bool, "sqpoll", "Enable IORING_SETUP_SQPOLL on the io_uring backend (default: false)") orelse false;
+    // K-means Lloyd-iteration count used by `prep`. Default 40 = production
+    // quality (see dataset_blob.zig commentary). Drop to 5–10 for faster
+    // local dev cycles when centroid quality doesn't matter — search results
+    // stay exact regardless via the bbox-pruned repair pass.
+    const kmeans_iters = b.option(usize, "kmeans-iters", "K-means Lloyd iters used by `prep` (default: 40)") orelse 40;
+    // Fast-path prep: when nonzero, switches `prep` from full-dataset
+    // k-means++ to a deterministic stride-sample of this size + vanilla
+    // Lloyd over only that sample. Mirrors thiagorigonatti's IVF6 prep.
+    // Default 0 = production prep.
+    const kmeans_sample = b.option(usize, "kmeans-sample", "Fast-path k-means stride-sample size (default: 0 = full data, k-means++)") orelse 0;
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "keep_alive", keep_alive);
     build_opts.addOption(bool, "instrument", instrument);
     build_opts.addOption(bool, "use_uring", use_uring);
     build_opts.addOption(bool, "sqpoll", sqpoll);
+    build_opts.addOption(usize, "kmeans_iters", kmeans_iters);
+    build_opts.addOption(usize, "kmeans_sample", kmeans_sample);
     // Materialize the build_options module once and share it across the
     // library and exe modules — calling `addOptions` on each module would
     // mint two distinct modules and zig would refuse the duplicate-source.

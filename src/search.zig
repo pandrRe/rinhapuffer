@@ -26,10 +26,18 @@ const instrument = @import("instrument.zig");
 pub const N_FEATURES: usize = transform_reference.N_FEATURES;
 pub const TOP_K: usize = 5;
 
-/// Number of clusters scanned per query in `euclidean_topk_q_ivf`. Mirrors
-/// `dataset_blob.PROBE_CLUSTERS` (which lives there for layout commentary);
-/// kept private here to avoid a circular import.
-const PROBE_CLUSTERS: usize = 8;
+/// Number of clusters scanned in nearest-first order before the bbox-pruned
+/// repair pass. Each subsequent probe is gated by `lb_sq[c] < top_dists[0]`.
+const PROBE_CLUSTERS: usize = 1;
+
+/// Cap on how many of the K-PROBE remaining clusters get visited by the
+/// bbox-pruned repair pass — only the top-N smallest by `lb_sq` (closest
+/// bounding-box) are considered. Bounds the long-tail "many clusters
+/// survive the prune" queries that dominated the eval p99. Safe vs the
+/// unbounded version because the unbounded scan only ever scans clusters
+/// with `lb_sq < top_dists[0]`, which (after PROBE seeds tight) is a
+/// small set living in the closest-bbox region.
+const REPAIR_TOP_N: usize = 64;
 
 /// Global fixed-point scale. Persisted in the v5 blob header so a stale blob
 /// built against a different value is rejected at load time.
@@ -110,9 +118,6 @@ pub fn euclidean_topk_q_ivf(
     // Step 1 (combined): per cluster, compute centroid distance² AND bbox
     // lower-bound² in the same loop. Both metadata regions (centroids 56KB,
     // bbox_lo+hi 56KB) are L2-resident and prefetched as the loop streams.
-    // Storing the LB² values means the post-probe repair pass at the bottom
-    // is a pure L1 lookup against `lb_sq[c]` — no re-fetching bbox lines
-    // after step 2's block scans evict them.
     var centroid_dists: [MAX_K_CLUSTERS]f32 = undefined;
     var lb_sq: [MAX_K_CLUSTERS]i64 = undefined;
     const Vf = @Vector(N_FEATURES, f32);
@@ -139,11 +144,8 @@ pub fn euclidean_topk_q_ivf(
     }
 
     // Step 2: select PROBE clusters with smallest centroid distance via a
-    // sorted insertion-sort accumulator. PROBE is small (8) — at K=1024,
-    // O(K·P) shifts are indistinguishable from O(K log P) heap ops, and the
-    // result is already ascending so the first cluster scanned is the
-    // closest (tightens `top_dists[0]` fastest). Mirrors thiagorigonatti #1
-    // `insert_probe_cluster` (rinha-2026/src/ivf_search.c:67).
+    // sorted insertion-sort accumulator. Result is ascending so the first
+    // cluster scanned is the closest (tightens `top_dists[0]` fastest).
     var probe_dists: [PROBE_CLUSTERS]f32 = @splat(std.math.inf(f32));
     var probe_idxs: [PROBE_CLUSTERS]u32 = @splat(0);
     for (0..qds.k_clusters) |c| {
@@ -160,34 +162,57 @@ pub fn euclidean_topk_q_ivf(
         probe_idxs[pos] = @intCast(c);
     }
 
-    // Step 3: scan PROBE clusters in nearest-first order, then bbox-prune
-    // the remaining K - PROBE in arbitrary order. Most fail-prune cheaply.
-    // We mark probed clusters by overwriting their centroid_dists with +inf
-    // so the bbox-prune pass below skips them via a single `< inf` compare —
-    // no separate `in_probe` bitset (saves 1 KiB stack + a write per probe).
+    // Step 3a: scan PROBE clusters in nearest-first order. Mark each by
+    // poisoning its `lb_sq` to maxInt so step 3b's top-N pick skips it.
     var top_dists: [TOP_K]i64 = @splat(std.math.maxInt(i64));
     var top_rows: [TOP_K]u32 = @splat(0);
 
-    centroid_dists[probe_idxs[0]] = std.math.inf(f32);
     scan_cluster_blocks(qds, probe_idxs[0], &q_int, &top_dists, &top_rows);
+    lb_sq[probe_idxs[0]] = std.math.maxInt(i64);
     instrument.inc(&instrument.search_clusters_probed, 1);
     inline for (1..PROBE_CLUSTERS) |i| {
         const c = probe_idxs[i];
-        centroid_dists[c] = std.math.inf(f32);
         if (lb_sq[c] < top_dists[0]) {
             scan_cluster_blocks(qds, c, &q_int, &top_dists, &top_rows);
             instrument.inc(&instrument.search_clusters_probed, 1);
         } else {
             instrument.inc(&instrument.search_clusters_bbox_skipped, 1);
         }
+        lb_sq[c] = std.math.maxInt(i64);
     }
+
+    // Step 3b: capped bbox repair. Pick the REPAIR_TOP_N un-probed clusters
+    // with smallest `lb_sq` via insertion-sort, then walk in ascending
+    // order. The unbounded version walked all K-PROBE clusters in arbitrary
+    // order with the same prune check — capping bounds long-tail queries
+    // where many clusters survive `lb_sq < top_dists[0]`. Safe because
+    // every cluster the unbounded version actually scans has small lb_sq
+    // (else it'd prune), so it lives in the top-N anyway. Once the array
+    // is sorted and we hit `lb_sq >= top_dists[0]`, all subsequent are
+    // also pruneable — break.
+    var repair_lb: [REPAIR_TOP_N]i64 = @splat(std.math.maxInt(i64));
+    var repair_idxs: [REPAIR_TOP_N]u32 = @splat(0);
     for (0..qds.k_clusters) |c| {
-        if (centroid_dists[c] == std.math.inf(f32)) continue;
-        if (lb_sq[c] >= top_dists[0]) {
-            instrument.inc(&instrument.search_clusters_bbox_skipped, 1);
-            continue;
+        const lb = lb_sq[c];
+        if (lb >= repair_lb[REPAIR_TOP_N - 1]) continue;
+        var pos: usize = REPAIR_TOP_N - 1;
+        while (pos > 0 and lb < repair_lb[pos - 1]) : (pos -= 1) {}
+        var i: usize = REPAIR_TOP_N - 1;
+        while (i > pos) : (i -= 1) {
+            repair_lb[i] = repair_lb[i - 1];
+            repair_idxs[i] = repair_idxs[i - 1];
         }
-        scan_cluster_blocks(qds, c, &q_int, &top_dists, &top_rows);
+        repair_lb[pos] = lb;
+        repair_idxs[pos] = @intCast(c);
+    }
+    for (0..REPAIR_TOP_N) |i| {
+        const lb = repair_lb[i];
+        if (lb == std.math.maxInt(i64)) break; // sentinel: ran out of un-probed clusters
+        if (lb >= top_dists[0]) {
+            instrument.inc(&instrument.search_clusters_bbox_skipped, 1);
+            break; // sorted ascending → all subsequent are pruneable too
+        }
+        scan_cluster_blocks(qds, repair_idxs[i], &q_int, &top_dists, &top_rows);
         instrument.inc(&instrument.search_clusters_bbox_scanned, 1);
     }
 

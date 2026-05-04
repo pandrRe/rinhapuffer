@@ -180,6 +180,112 @@ pub fn run_kmeans(
     }
 }
 
+/// Fast-path k-means for local debugging — no k-means++, no full-dataset
+/// Lloyd. Mirrors thiagorigonatti's IVF6 prep: deterministic stride-sample
+/// of `sample_n` rows used for both centroid init and every Lloyd
+/// iteration. Vastly faster than `run_kmeans` at the cost of looser
+/// cluster boundaries — search results stay **exact** because the
+/// bbox-pruned repair pass in `search.zig` is correctness-preserving
+/// regardless of cluster quality. Only p99 is affected (looser clusters
+/// → more clusters survive bbox prune → more rows scanned).
+///
+/// Init: K stride-spaced rows from the sample (no randomness, no
+/// k-means++ weighting). Empty clusters are silently kept at their prior
+/// position — at sample_n ≥ K this is rare in practice and matches the
+/// C reference.
+pub fn run_kmeans_fast(
+    allocator: std.mem.Allocator,
+    features_soa: []const f32,
+    n: usize,
+    k_clusters: usize,
+    sample_n: usize,
+    n_iter: usize,
+    centroids_out: []f32,
+) !void {
+    std.debug.assert(centroids_out.len == k_clusters * N_FEATURES);
+    std.debug.assert(features_soa.len == N_FEATURES * n);
+    std.debug.assert(n >= k_clusters);
+    std.debug.assert(sample_n >= k_clusters);
+    std.debug.assert(sample_n <= n);
+
+    // Deterministic stride sample: `sample[i] = (i * n) / sample_n`. Same
+    // recipe as the C reference's integer-divide, evenly-spaced indices.
+    const sample = try allocator.alloc(u32, sample_n);
+    defer allocator.free(sample);
+    for (0..sample_n) |i| {
+        const idx: usize = (i * n) / sample_n;
+        sample[i] = @intCast(idx);
+    }
+
+    // Init: K stride-spaced picks from the sample.
+    for (0..k_clusters) |c| {
+        var si: usize = (c * sample_n) / k_clusters;
+        if (si >= sample_n) si = sample_n - 1;
+        const row = sample[si];
+        inline for (0..N_FEATURES) |k| {
+            centroids_out[c * N_FEATURES + k] = features_soa[k * n + row];
+        }
+    }
+
+    const sums = try allocator.alloc(f32, k_clusters * N_FEATURES);
+    defer allocator.free(sums);
+    const counts = try allocator.alloc(u32, k_clusters);
+    defer allocator.free(counts);
+    const half_norm_sq = try allocator.alloc(f32, k_clusters);
+    defer allocator.free(half_norm_sq);
+
+    for (0..n_iter) |_| {
+        for (0..k_clusters) |c| {
+            var ss: f32 = 0;
+            inline for (0..N_FEATURES) |k| {
+                const v = centroids_out[c * N_FEATURES + k];
+                ss += v * v;
+            }
+            half_norm_sq[c] = 0.5 * ss;
+        }
+
+        @memset(sums, 0);
+        @memset(counts, 0);
+
+        // Assign + accumulate sum in one pass over the sample only.
+        // Argmax (row·c − ½‖c‖²); tiebreak lowest cluster index.
+        for (0..sample_n) |s| {
+            const row = sample[s];
+            var best: f32 = -std.math.inf(f32);
+            var best_c: u32 = 0;
+            for (0..k_clusters) |c| {
+                var dot: f32 = 0;
+                inline for (0..N_FEATURES) |k| {
+                    dot = @mulAdd(
+                        f32,
+                        features_soa[k * n + row],
+                        centroids_out[c * N_FEATURES + k],
+                        dot,
+                    );
+                }
+                const score = dot - half_norm_sq[c];
+                if (score > best) {
+                    best = score;
+                    best_c = @intCast(c);
+                }
+            }
+            counts[best_c] += 1;
+            inline for (0..N_FEATURES) |k| {
+                sums[@as(usize, best_c) * N_FEATURES + k] += features_soa[k * n + row];
+            }
+        }
+
+        // Update non-empty clusters; empty stays at its prior position.
+        for (0..k_clusters) |c| {
+            if (counts[c] == 0) continue;
+            const inv_count: f32 = 1.0 / @as(f32, @floatFromInt(counts[c]));
+            inline for (0..N_FEATURES) |k| {
+                centroids_out[c * N_FEATURES + k] = sums[c * N_FEATURES + k] * inv_count;
+            }
+        }
+    }
+}
+
 /// Argmin-Euclidean assignment of every row in `features_soa` against
 /// `centroids`. Tiebreak: lowest centroid index wins. Writes one u32 per row.
 /// Caller-owned scratch buffer `half_norm_sq_scratch` of length `k_clusters`

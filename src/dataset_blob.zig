@@ -56,6 +56,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const transform_reference = @import("transform_reference.zig");
 const fast_json = @import("fast_json.zig");
 const kmeans = @import("kmeans.zig");
@@ -95,13 +96,18 @@ pub const PROBE_CLUSTERS: usize = 8;
 /// Random seed used for k-means init. Pinned so prep is deterministic.
 pub const KMEANS_SEED: u64 = 0xa5a5_a5a5_a5a5_a5a5;
 
-/// k-means Lloyd-iteration count after k-means++ init. Higher than the
-/// pre-k-means++ default (20) because k-means++ delivers a usable starting
-/// configuration that benefits from extra refinement; with vanilla random
-/// init the marginal gain past iter 20 was negligible (stuck in local
-/// minima). All n rows are used (no sample cap), so each iter is one full
-/// O(N·K·d) sweep.
-pub const KMEANS_ITERS: usize = 40;
+/// k-means Lloyd-iteration count. Default 40 — k-means++ delivers a usable
+/// starting configuration that benefits from extra refinement (with vanilla
+/// random init the marginal gain past iter 20 was negligible — stuck in
+/// local minima). Production: full dataset, each iter O(N·K·d). Drop via
+/// `-Dkmeans-iters=N` for faster local prep.
+pub const KMEANS_ITERS: usize = build_options.kmeans_iters;
+
+/// Fast-path stride-sample size. 0 = full-dataset k-means++ (production).
+/// Nonzero = `kmeans.run_kmeans_fast` over a deterministic stride sample
+/// — looser clusters, much faster prep. Search remains exact via the
+/// bbox-pruned repair pass; only p99 is affected. See `-Dkmeans-sample`.
+pub const KMEANS_SAMPLE: usize = build_options.kmeans_sample;
 
 pub const Header = extern struct {
     magic: u32,
@@ -361,19 +367,34 @@ pub fn write(
     const n = ds.n;
     const n_u32: u32 = @intCast(n);
 
-    // 1. Run k-means over the full dataset (k-means++ init + Lloyd iters).
+    // 1. Run k-means. Production: full-dataset k-means++ + Lloyd iters.
+    //    Fast path (`-Dkmeans-sample=N`): stride-sample init + Lloyd over
+    //    sample only. Looser clusters but search stays exact via bbox repair.
     const centroids = try allocator.alloc(f32, @as(usize, k_clusters) * N_FEATURES);
     defer allocator.free(centroids);
 
-    try kmeans.run_kmeans(
-        allocator,
-        ds.features,
-        n,
-        k_clusters,
-        KMEANS_ITERS,
-        KMEANS_SEED,
-        centroids,
-    );
+    if (KMEANS_SAMPLE != 0) {
+        const sample_n = @min(KMEANS_SAMPLE, n);
+        try kmeans.run_kmeans_fast(
+            allocator,
+            ds.features,
+            n,
+            k_clusters,
+            sample_n,
+            KMEANS_ITERS,
+            centroids,
+        );
+    } else {
+        try kmeans.run_kmeans(
+            allocator,
+            ds.features,
+            n,
+            k_clusters,
+            KMEANS_ITERS,
+            KMEANS_SEED,
+            centroids,
+        );
+    }
 
     // 2. Assign every row to its cluster.
     const assignments = try allocator.alloc(u32, n);
